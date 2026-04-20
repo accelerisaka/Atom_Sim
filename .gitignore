@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 仿真输出 (运行产物，不纳入版本控制)
+output/frame_*.png
+output/simulation.gif
+output/simulation.mp4
+output/history.json
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

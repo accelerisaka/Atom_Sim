@@ -21,11 +21,13 @@ class RigidBody2D(AtomicSimulator):
     TAU = 0.5          # 期望速度松弛时间 (s)
     A_REP = 2000.0     # 个体间排斥力振幅 (N)
     B_REP = 0.08       # 排斥力衰减尺度 (m)
-    A_WALL = 3000.0    # 墙壁排斥力振幅 (N)
-    B_WALL = 0.1       # 墙壁排斥力衰减尺度 (m)
+    A_WALL = 2000.0    # 墙壁排斥力振幅 (N)
+    B_WALL = 0.08      # 墙壁排斥力衰减尺度 (m)
     AGENT_RADIUS = 0.25  # 个体半径 (m)
     MAX_SPEED = 2.0    # 最大速度限制 (m/s)
     MASS = 80.0        # 个体质量 (kg)
+    HERD_WEIGHT = 0.3  # 从众偏置对期望速度的叠加权重 (0=忽略, 1=平均)
+    EXIT_REACH_DIST = 1.2  # 到达出口判定半径 (m)
 
     def __init__(
         self,
@@ -71,15 +73,25 @@ class RigidBody2D(AtomicSimulator):
 
         # 外部输入
         desired_vel_input = self.inputs.get("desired_velocity")
+        herd_bias_input = self.inputs.get("herd_bias")
         flow_constraint = self.inputs.get("flow_constraint", 1.0)
         ext_impulses = self.inputs.get("external_impulses")
         efficiency = self.inputs.get("cognitive_efficiency", 1.0)
 
-        # 为每个 agent 计算目标方向
+        # 语义分离：
+        #   desired_velocity  -> 完整覆盖（用于脚本化控制/测试）
+        #   herd_bias         -> 叠加偏置（用于社会力耦合，如 S2 从众）
+        # 二者可同时存在，从众偏置始终与出口驱动方向混合，避免出现
+        # "整体期望速度被拉至 0" 的冻结人群伪影。
         if desired_vel_input is not None and isinstance(desired_vel_input, np.ndarray):
-            desired_vel = desired_vel_input
+            desired_vel = desired_vel_input.astype(np.float64).copy()
         else:
             desired_vel = self._compute_desired_velocity(pos, active, efficiency)
+
+        if herd_bias_input is not None and isinstance(herd_bias_input, np.ndarray):
+            bias = np.asarray(herd_bias_input, dtype=np.float64)
+            if bias.shape == desired_vel.shape:
+                desired_vel = (1.0 - self.HERD_WEIGHT) * desired_vel + self.HERD_WEIGHT * bias
 
         # 应用瓶颈限速
         if isinstance(flow_constraint, (int, float)):
@@ -153,10 +165,10 @@ class RigidBody2D(AtomicSimulator):
         pos_new[:, 0] = np.clip(pos_new[:, 0], 0.0, self.world_size[0])
         pos_new[:, 1] = np.clip(pos_new[:, 1], 0.0, self.world_size[1])
 
-        # 检测是否到达出口
+        # 检测是否到达出口（仅对仍然活跃的个体生效）
         for ex in self._exit_positions:
             dist_to_exit = np.linalg.norm(pos_new - ex, axis=1)
-            escaped = dist_to_exit < 1.0
+            escaped = (dist_to_exit < self.EXIT_REACH_DIST) & active & ~fallen
             active[escaped] = False
 
         # 检测跌倒（密集碰撞 + 随机概率）
@@ -174,13 +186,21 @@ class RigidBody2D(AtomicSimulator):
         self.current_time += dt
 
     def _compute_desired_velocity(
-        self, pos: np.ndarray, active: np.ndarray, efficiency: float
+        self, pos: np.ndarray, active: np.ndarray, efficiency: Any
     ) -> np.ndarray:
-        """默认：朝最近出口移动。"""
+        """默认：朝最近出口移动。efficiency 可为标量或 per-agent 数组。"""
         n = pos.shape[0]
         desired = np.zeros_like(pos)
         if not self._exit_positions:
             return desired
+
+        eff_arr = np.asarray(efficiency, dtype=np.float64).ravel()
+        if eff_arr.size == 0:
+            eff_arr = np.ones(n)
+        elif eff_arr.size == 1:
+            eff_arr = np.full(n, float(eff_arr[0]))
+        elif eff_arr.size != n:
+            eff_arr = np.full(n, float(eff_arr.mean()))
 
         for i in range(n):
             if not active[i]:
@@ -191,7 +211,7 @@ class RigidBody2D(AtomicSimulator):
             norm = np.linalg.norm(direction)
             if norm > 1e-6:
                 direction /= norm
-            desired[i] = direction * self.state["desired_speed"][i] * efficiency
+            desired[i] = direction * self.state["desired_speed"][i] * eff_arr[i]
 
         return desired
 
@@ -217,7 +237,7 @@ class RigidBody2D(AtomicSimulator):
     def schema(self) -> Dict[str, Any]:
         return {
             "inputs": [
-                "desired_velocity", "external_impulses",
+                "desired_velocity", "herd_bias", "external_impulses",
                 "flow_constraint", "cognitive_efficiency",
             ],
             "outputs": ["positions", "velocities", "active", "fallen"],

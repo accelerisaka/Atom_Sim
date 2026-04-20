@@ -342,13 +342,22 @@ def main(config_path: str = "config/topology.yaml") -> None:
 
     walls = scenario.get("walls", [])
     exits = scenario.get("exits", [])
-    frame_paths = renderer.render_all(
+    frames = renderer.render_all_to_arrays(
         orch.history,
         world_size=(25.0, 25.0),
         walls=walls,
         exits=exits,
     )
-    logger.info(f"Rendered {len(frame_paths)} frames to output/")
+    logger.info(f"Rendered {len(frames)} frames in memory (no PNG disk I/O).")
+
+    # ---- 12. 合成动图 / 视频 ----
+    gif_path = renderer.export_gif(frames, fps=4, scale=0.6)
+    if gif_path:
+        logger.info(f"GIF exported: {gif_path}")
+
+    video_path = renderer.export_video(frames, fps=8)
+    if video_path:
+        logger.info(f"Video exported: {video_path}")
 
 
 if __name__ == "__main__":
