@@ -61,7 +61,7 @@ simulators:
     class: "atoms.physical.RigidBody2D"
     group: micro
     params:
-      num_agents: 50
+      num_agents: 200
       world_size: [25.0, 25.0]
 
   P6:
@@ -76,32 +76,32 @@ simulators:
     class: "atoms.social.EmotionAppraisal"
     group: macro
     params:
-      num_agents: 50
+      num_agents: 200
 
   BP6:
     class: "atoms.social.StressPerformanceCurve"
     group: macro
     params:
-      num_agents: 50
+      num_agents: 200
 
   S2:
     class: "atoms.social.HerdBehavior"
     group: meso
     params:
-      num_agents: 50
+      num_agents: 200
       neighbor_radius: 3.0
 
   SD4:
     class: "atoms.social.BystanderEffect"
     group: event
     params:
-      num_agents: 50
+      num_agents: 200
 
   BP5:
     class: "atoms.social.AttentionAllocator"
     group: meso
     params:
-      num_agents: 50
+      num_agents: 200
 
 # ----------------------------------------------------------
 # S2S 连接拓扑
@@ -247,7 +247,7 @@ connections:
 # ----------------------------------------------------------
 scenario:
   duration: 60.0           # 仿真时长 (秒)
-  snapshot_interval: 0.5   # 快照间隔 (秒)
+  snapshot_interval: 1   # 快照间隔 (秒)
 
   ignition_points:
     - [10, 10, 800]        # (row, col, temperature)

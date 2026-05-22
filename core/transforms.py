@@ -511,6 +511,7 @@ def visibility_field_to_exit_visibility(field_V: Any) -> float:
 #
 #   TRANSFORM_REGISTRY["temperature_field_to_per_agent_danger"].context_aware  # True
 # =============================================================================
+<<<<<<< HEAD
 
 
 # =============================================================================
@@ -563,3 +564,5 @@ def temperature_field_to_per_household_temp(
     cell_size = _get_grid_cell_size(ctx, "TD1", fallback=1.0)
     return _sample_field_at_positions(field_T, positions, cell_size, default=30.0)
 
+=======
+>>>>>>> f64cd4d9149a6fb0fa25377d142518edcbe9c0e2
