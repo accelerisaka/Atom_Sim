@@ -1,0 +1,205 @@
+# ============================================================
+# 智能电网负载均衡 — S2S 拓扑连接配置
+# ============================================================
+#
+# 场景：夏季高温 → 大量空调开启 → 局部变压器过载 → 动态电价上升
+#       → 价格敏感用户上调设定温度 → 总负荷下降 → 电价回落（负反馈闭环）
+#
+# 重要约定：
+#   每一条 S2S 连接都必须显式声明 `transform` 字段，
+#   该字段的取值必须是 core/transforms.py 中 TRANSFORM_REGISTRY
+#   已注册的名字。即使源/目标数据形式一致（仅端口重命名），
+#   也必须声明 transform: identity，以保证系统内不存在隐性耦合。
+# ============================================================
+
+# ----------------------------------------------------------
+# 时间分组
+# ----------------------------------------------------------
+time_groups:
+  weather:
+    dt: 1.0
+    description: "户外热环境（缓变）+ 静态家庭档案"
+  device:
+    dt: 0.5
+    description: "空调与变压器（毫秒级响应的设备层 → 在仿真单位中折算为亚秒级）"
+  market:
+    dt: 2.0
+    description: "电价市场与心理决策（慢响应）"
+  event:
+    dt: 0.0
+    description: "事件驱动（变压器过载脉冲）"
+
+# ----------------------------------------------------------
+# 仿真器注册
+# ----------------------------------------------------------
+simulators:
+
+  # —— 户外温度场 (复用 atoms.physical.HeatConduction) ——
+  TD1:
+    class: "atoms.physical.HeatConduction"
+    group: weather
+    params:
+      grid_size: [30, 30]
+      cell_size: 1.0
+      alpha: 0.06
+      ambient_temp: 31.0          # 夏季基础户外温度
+
+  # —— 家庭档案/位置 (新建) ——
+  HU1:
+    class: "atoms.physical.HouseholdLayout"
+    group: weather
+    params:
+      num_households: 24
+      world_size: [30.0, 30.0]
+      sensitivity_range: [0.15, 1.0]
+      setpoint_range: [23.5, 27.5]
+      seed: 2026
+
+  # —— 空调用电负荷 (新建) ——
+  AC1:
+    class: "atoms.physical.ACLoadDevice"
+    group: device
+    params:
+      num_households: 24
+      cooling_coeff: 0.55
+      max_load_per_house: 3.0
+      idle_load: 0.15
+      on_threshold: 0.5
+
+  # —— 变压器汇总 + 过载状态 (新建) ——
+  GR1:
+    class: "atoms.physical.GridTransformer"
+    group: device
+    params:
+      capacity_kw: 38.0
+      num_households: 24
+      overload_event_threshold: 1.0
+
+  # —— 动态电价市场 (新建) ——
+  MK1:
+    class: "atoms.social.PriceMarket"
+    group: market
+    params:
+      base_price: 0.55
+      max_multiplier: 4.0
+      sensitivity: 3.0
+      threshold: 0.8
+      nonlinearity: 1.4
+      smoothing: 0.35
+      pulse_boost: 0.6
+
+  # —— 价格敏感度心理评估 (新建) ——
+  PD7:
+    class: "atoms.social.PriceSensitivityAppraisal"
+    group: market
+    params:
+      num_households: 24
+      reference_price: 0.55
+      max_uplift: 4.0
+      elasticity: 2.5
+      inertia: 0.55
+      comfort_brake_temp: 32.0
+
+# ----------------------------------------------------------
+# S2S 连接拓扑
+# ----------------------------------------------------------
+connections:
+
+  # ========== 1. 物理环境 → 设备/心理（场→逐户采样） ==========
+
+  - connection_id: td1_temp_to_ac1
+    source: { sim_id: TD1, port: temperature_field }
+    target: { sim_id: AC1, port: local_temp }
+    strategy: AVG
+    transform: temperature_field_to_per_household_temp
+    description: "户外温度场(°C, 2D) → 逐户局部温度 ndarray[N] (按 HU1.positions 采样, AVG 抑制扩散噪声)"
+
+  - connection_id: td1_temp_to_pd7
+    source: { sim_id: TD1, port: temperature_field }
+    target: { sim_id: PD7, port: local_temp }
+    strategy: AVG
+    transform: temperature_field_to_per_household_temp
+    description: "户外温度场 → 逐户局部温度 (心理决策的舒适刹车参考)"
+
+  # ========== 2. 静态档案分发：HU1 → PD7 ==========
+
+  - connection_id: hu1_sensitivity_to_pd7
+    source: { sim_id: HU1, port: price_sensitivity }
+    target: { sim_id: PD7, port: price_sensitivity }
+    strategy: ZOH
+    transform: identity
+    description: "逐户价格敏感度（静态档案，端口重命名 / identity）"
+
+  - connection_id: hu1_basesp_to_pd7
+    source: { sim_id: HU1, port: base_setpoint }
+    target: { sim_id: PD7, port: base_setpoint }
+    strategy: ZOH
+    transform: identity
+    description: "逐户舒适基准设定温度（静态档案，identity）"
+
+  # ========== 3. 心理决策 → 设备 ==========
+
+  - connection_id: pd7_setpoint_to_ac1
+    source: { sim_id: PD7, port: setpoint }
+    target: { sim_id: AC1, port: setpoint }
+    strategy: INTERP
+    transform: identity
+    description: "逐户设定温度 → 空调控制 (INTERP 防快慢组阶跃)"
+
+  # ========== 4. 设备 → 电网 ==========
+
+  - connection_id: ac1_load_to_gr1
+    source: { sim_id: AC1, port: power_load }
+    target: { sim_id: GR1, port: household_loads }
+    strategy: AVG
+    transform: identity
+    description: "逐户负荷 ndarray[N] kW → 变压器汇总 (AVG 平滑设备开关瞬态)"
+
+  # ========== 5. 电网 → 市场（双通道：慢通道 AVG + 事件通道 EVENT） ==========
+
+  - connection_id: gr1_overload_to_mk1
+    source: { sim_id: GR1, port: overload_ratio }
+    target: { sim_id: MK1, port: overload_signal }
+    strategy: AVG
+    transform: identity
+    description: "过载比 ρ → 慢通道电价依据 (AVG 在 market.dt 窗口内平均)"
+
+  - connection_id: gr1_overload_event_to_mk1
+    source: { sim_id: GR1, port: overload_pulse_ratio }
+    target: { sim_id: MK1, port: overload_pulse }
+    strategy: EVENT
+    transform: identity
+    description: "过载边沿事件 → MK1 即时调高目标价 (EVENT 通道, 在 OVERLOAD 事件中注入)"
+
+  # ========== 6. 市场 → 心理（闭环负反馈） ==========
+
+  - connection_id: mk1_price_to_pd7
+    source: { sim_id: MK1, port: electricity_price }
+    target: { sim_id: PD7, port: current_price }
+    strategy: ZOH
+    transform: identity
+    description: "电价 → 用户心理感知 (ZOH 跨慢→慢组安全；闭合需求侧响应回路)"
+
+# ----------------------------------------------------------
+# 场景初始条件
+# ----------------------------------------------------------
+scenario:
+  duration: 120.0          # 仿真总时长（秒，可解读为 120 个时间单位）
+  snapshot_interval: 1.0
+
+  # TD1 (HeatConduction) 的"户外日照热岛"——多个固定加热点
+  # 每行: [row, col, intensity]  (row, col 单位为格点, intensity °C)
+  hot_zones:
+    - [5,  5,  44.0]
+    - [8,  22, 47.0]
+    - [22, 8,  46.0]
+    - [25, 25, 45.0]
+    - [15, 15, 43.0]
+
+  # 是否在 t=30s 注入"热浪事件"——临时再叠加几个高温热岛
+  heat_wave:
+    enabled: true
+    trigger_time: 35.0
+    extra_zones:
+      - [12, 18, 50.0]
+      - [18, 12, 50.0]

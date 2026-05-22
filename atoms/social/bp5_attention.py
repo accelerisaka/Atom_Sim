@@ -1,7 +1,19 @@
 """
-BP5: AttentionAllocator — 注意力分配仿真。
-认知限制：浓烟和高温会强制占用注意力资源，导致个体忽略逃生指示牌。
+BP5: AttentionAllocator — 注意力分配仿真（逐个体）。
+认知限制：每个个体所处位置的烟雾浓度和环境噪声独立占用其注意力资源，
+导致其忽略逃生指示牌的程度各异。
 Natural DT = 0.1s
+
+端口契约 (Input Port Schema)
+----------------------------
+- smoke_exposure : ndarray[n] float in [0, 1]
+    每个个体所处位置的烟雾暴露度；由 S2S 总线上的 transform 按 CM1.positions
+    在烟雾浓度场中采样得到。
+- noise_level    : float in [0, 1] 或 ndarray[n]
+    环境噪声水平（目前假设场景均匀，标量即可）；如果未来要做"按位置的噪声场"，
+    在 core/transforms.py 新增相应 transform 并递交 ndarray[n] 即可。
+
+兼容性兜底：若输入为标量或 None，会被广播成长度 n 的数组。
 """
 
 from __future__ import annotations
@@ -14,7 +26,7 @@ from core.base import AtomicSimulator
 
 
 class AttentionAllocator(AtomicSimulator):
-    """注意力资源分配仿真器。"""
+    """逐个体注意力资源分配仿真器。"""
 
     def __init__(
         self,
@@ -31,33 +43,35 @@ class AttentionAllocator(AtomicSimulator):
         # perception_mask: 1.0 = 完全感知, 0.0 = 完全失去感知
         self.state["perception_mask"] = np.ones(num_agents, dtype=np.float64)
 
-    def step(self, dt: float) -> None:
+    # ------------------------------------------------------------------
+    # 内部工具
+    # ------------------------------------------------------------------
+
+    def _to_per_agent(self, value: Any, default: float) -> np.ndarray:
         n = self.num_agents
+        if value is None:
+            return np.full(n, default, dtype=np.float64)
 
-        smoke = self.inputs.get("smoke_density", 0.0)
-        noise = self.inputs.get("noise_level", 0.0)
+        arr = np.asarray(value, dtype=np.float64).ravel()
+        if arr.size == 0:
+            return np.full(n, default, dtype=np.float64)
+        if arr.size == 1:
+            return np.full(n, float(arr[0]), dtype=np.float64)
+        if arr.size < n:
+            pad = np.full(n - arr.size, default, dtype=np.float64)
+            return np.concatenate([arr, pad])
+        return arr[:n]
 
-        if isinstance(smoke, np.ndarray):
-            smoke_vals = np.clip(smoke.ravel()[:n], 0.0, 1.0)
-            if smoke_vals.shape[0] < n:
-                smoke_vals = np.pad(smoke_vals, (0, n - smoke_vals.shape[0]), constant_values=0.0)
-        else:
-            smoke_vals = np.full(n, np.clip(float(smoke), 0.0, 1.0))
+    # ------------------------------------------------------------------
+    # 主步进
+    # ------------------------------------------------------------------
 
-        if isinstance(noise, np.ndarray):
-            noise_vals = np.clip(noise.ravel()[:n], 0.0, 1.0)
-            if noise_vals.shape[0] < n:
-                noise_vals = np.pad(noise_vals, (0, n - noise_vals.shape[0]), constant_values=0.0)
-        else:
-            noise_vals = np.full(n, np.clip(float(noise), 0.0, 1.0))
+    def step(self, dt: float) -> None:
+        smoke = np.clip(self._to_per_agent(self.inputs.get("smoke_exposure"), 0.0), 0.0, 1.0)
+        noise = np.clip(self._to_per_agent(self.inputs.get("noise_level"), 0.0), 0.0, 1.0)
 
-        # 注意力被占用的比例
-        attention_used = (
-            self.smoke_cost * smoke_vals
-            + self.noise_cost * noise_vals
-        )
-
-        # 剩余可用于感知逃生信息的注意力
+        # 逐个体注意力占用
+        attention_used = self.smoke_cost * smoke + self.noise_cost * noise
         remaining = 1.0 - np.clip(attention_used, 0.0, 1.0)
 
         self.state["perception_mask"] = np.clip(remaining, 0.05, 1.0)
@@ -68,6 +82,6 @@ class AttentionAllocator(AtomicSimulator):
 
     def schema(self) -> Dict[str, Any]:
         return {
-            "inputs": ["smoke_density", "noise_level"],
+            "inputs": ["smoke_exposure", "noise_level"],
             "outputs": ["perception_mask"],
         }

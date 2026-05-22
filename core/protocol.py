@@ -33,20 +33,38 @@ class S2SConnection:
     一条 S2S 连接，描述了:
     - 源端口 -> 目标端口
     - 跨速率交换策略
-    - 可选的数据变换函数
+    - 数据变换函数 (transform) 及其注册名 (transform_name)
     - 最小延迟（用于打破代数环）
+    - 描述文本 (description) 便于 coding agent 读取
+
+    注意：`transform` 必须来自 `core.transforms.TRANSFORM_REGISTRY`。
+    原则上每一条连接都应显式声明 transform_name，即使是 `identity` 也要形式化声明，
+    以保证系统内不存在"隐性耦合"。
     """
     connection_id: str
     source: PortAddress
     target: PortAddress
     strategy: ExchangeStrategy = ExchangeStrategy.ZOH
-    transform: Optional[Callable[[Any], Any]] = None
+    # 注：所有通过 core.transforms.register_transform 注册的 transform，
+    # 其可调用对象都被统一包裹为二参形式 `fn(value, ctx)`。
+    # 即使原始是一参纯函数，包裹层也会忽略 ctx，保持调用点契约统一。
+    transform: Optional[Callable[..., Any]] = None
+    transform_name: Optional[str] = None
     min_delay: float = 0.0
+    description: str = ""
 
-    def apply_transform(self, value: Any) -> Any:
-        if self.transform is not None:
+    def apply_transform(self, value: Any, ctx: Any = None) -> Any:
+        """
+        应用 transform。`ctx` 为 `core.transforms.TransformContext`（可选），
+        用于需要跨仿真器多源数据的变换（如按个体位置采样场）。
+        """
+        if self.transform is None:
+            return value
+        try:
+            return self.transform(value, ctx)
+        except TypeError:
+            # 兜底：旧式一参 transform（未经 register_transform 包裹时的直接注入）
             return self.transform(value)
-        return value
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -54,13 +72,16 @@ class S2SConnection:
             "source": repr(self.source),
             "target": repr(self.target),
             "strategy": self.strategy.value,
+            "transform": self.transform_name,
             "min_delay": self.min_delay,
+            "description": self.description,
         }
 
     def __repr__(self) -> str:
+        tf = f" via {self.transform_name}" if self.transform_name else ""
         return (
             f"S2S[{self.connection_id}] "
-            f"{self.source} --({self.strategy.value})--> {self.target}"
+            f"{self.source} --({self.strategy.value}{tf})--> {self.target}"
         )
 
 

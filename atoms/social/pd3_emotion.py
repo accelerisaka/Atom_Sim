@@ -1,8 +1,25 @@
 """
-PD3: EmotionAppraisal — 恐慌情绪生成。
+PD3: EmotionAppraisal — 恐慌情绪生成（逐个体）。
 理论依据：Scherer 的认知评估模型 (CPM)。
-基于"新奇性"、"目标阻碍"和"应对潜力"评估恐慌值。
+每个个体基于其所处环境的"新奇性""目标阻碍""应对潜力"独立评估自身恐慌值。
 Natural DT = 0.5s
+
+设计原则
+--------
+本原子不负责 **任何** 物理量到 [0, 1] 的归一化、场聚合或空间采样；
+所有来自上游仿真器的输入都应该已经是 **逐个体的** ndarray[num_agents]，
+单位/语义符合本原子的端口契约。
+
+具体的"场 → 逐个体"空间采样在 core/transforms.py 中定义，
+由 S2S 总线按每个 tick 的 CM1.positions 在 transform 里完成。
+
+端口契约 (Input Port Schema)
+----------------------------
+- local_danger     : ndarray[n] float in [0, 1]  — 每个个体位置处的热暴露危险度
+- smoke_exposure   : ndarray[n] float in [0, 1]  — 每个个体位置处的烟雾暴露度
+- exit_visibility  : ndarray[n] float in [0, 1]  — 每个个体位置处的可见度 (1=完全可见)
+
+兼容性兜底：若输入为标量或 None，会被广播成长度 n 的数组。
 """
 
 from __future__ import annotations
@@ -15,7 +32,7 @@ from core.base import AtomicSimulator
 
 
 class EmotionAppraisal(AtomicSimulator):
-    """基于 CPM 的恐慌情绪评估仿真器。"""
+    """基于 CPM 的逐个体恐慌情绪评估仿真器。"""
 
     def __init__(
         self,
@@ -24,7 +41,7 @@ class EmotionAppraisal(AtomicSimulator):
         novelty_weight: float = 0.3,
         obstruction_weight: float = 0.4,
         coping_weight: float = 0.3,
-        inertia: float = 0.7,
+        inertia: float = 0.4,
     ):
         super().__init__(sim_id, natural_dt=0.5)
         self.num_agents = num_agents
@@ -35,39 +52,41 @@ class EmotionAppraisal(AtomicSimulator):
 
         self.state["panic_level"] = np.zeros(num_agents, dtype=np.float64)
 
+    # ------------------------------------------------------------------
+    # 内部工具：把任意形式的输入规整为长度 n 的 float 数组
+    # ------------------------------------------------------------------
+
+    def _to_per_agent(self, value: Any, default: float) -> np.ndarray:
+        n = self.num_agents
+        if value is None:
+            return np.full(n, default, dtype=np.float64)
+
+        arr = np.asarray(value, dtype=np.float64).ravel()
+        if arr.size == 0:
+            return np.full(n, default, dtype=np.float64)
+        if arr.size == 1:
+            return np.full(n, float(arr[0]), dtype=np.float64)
+        if arr.size < n:
+            pad = np.full(n - arr.size, default, dtype=np.float64)
+            return np.concatenate([arr, pad])
+        return arr[:n]
+
+    # ------------------------------------------------------------------
+    # 主步进
+    # ------------------------------------------------------------------
+
     def step(self, dt: float) -> None:
         panic = self.state["panic_level"]
-        n = self.num_agents
 
-        local_temp = self.inputs.get("local_temperature", 20.0)
-        smoke = self.inputs.get("smoke_density", 0.0)
-        exit_visible = self.inputs.get("is_exit_visible", True)
+        danger = np.clip(self._to_per_agent(self.inputs.get("local_danger"), 0.0), 0.0, 1.0)
+        smoke = np.clip(self._to_per_agent(self.inputs.get("smoke_exposure"), 0.0), 0.0, 1.0)
+        exit_vis = np.clip(self._to_per_agent(self.inputs.get("exit_visibility"), 1.0), 0.0, 1.0)
 
-        # --- 新奇性评估：温度 / 烟雾突然升高 ---
-        if isinstance(local_temp, np.ndarray):
-            temp_vals = np.clip((local_temp - 40.0) / 300.0, 0.0, 1.0)
-        else:
-            temp_vals = np.full(n, np.clip((float(local_temp) - 40.0) / 300.0, 0.0, 1.0))
+        # CPM 三要素（逐个体）
+        novelty = np.maximum(danger, smoke)           # 热/烟中较严重者驱动新奇性
+        obstruction = 1.0 - exit_vis                   # 可见度越低阻碍越大
+        coping = np.clip(1.0 - smoke * 0.5, 0.0, 1.0)  # 烟雾削弱应对潜力
 
-        if isinstance(smoke, np.ndarray):
-            smoke_vals = np.clip(smoke, 0.0, 1.0)
-        else:
-            smoke_vals = np.full(n, np.clip(float(smoke), 0.0, 1.0))
-
-        novelty = np.maximum(temp_vals, smoke_vals)
-
-        # --- 目标阻碍：出口不可见 = 高阻碍 ---
-        if isinstance(exit_visible, np.ndarray):
-            obstruction = 1.0 - exit_visible.astype(np.float64)
-        elif isinstance(exit_visible, bool):
-            obstruction = np.full(n, 0.0 if exit_visible else 1.0)
-        else:
-            obstruction = np.full(n, 1.0 - float(exit_visible))
-
-        # --- 应对潜力：受体力和清醒度影响（简化为固定值 + 噪声）---
-        coping = np.clip(1.0 - smoke_vals * 0.5, 0.0, 1.0)
-
-        # --- CPM 综合评估 ---
         raw_panic = (
             self.w_novelty * novelty
             + self.w_obstruct * obstruction
@@ -85,6 +104,6 @@ class EmotionAppraisal(AtomicSimulator):
 
     def schema(self) -> Dict[str, Any]:
         return {
-            "inputs": ["local_temperature", "smoke_density", "is_exit_visible"],
+            "inputs": ["local_danger", "smoke_exposure", "exit_visibility"],
             "outputs": ["panic_level"],
         }

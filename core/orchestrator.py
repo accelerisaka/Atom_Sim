@@ -14,6 +14,7 @@ from .base import AtomicSimulator
 from .causality import CausalityGuard, TimeGroup
 from .protocol import EventMessage, ExchangeStrategy, S2SConnection
 from .strategies import StrategyEngine
+from .transforms import TransformContext
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +160,14 @@ class Orchestrator:
                     if target_sim is not None:
                         value = event.payload.get(conn.source.port)
                         if value is not None:
-                            target_sim.inputs[conn.target.port] = conn.apply_transform(value)
+                            ctx = TransformContext(
+                                simulators=self.simulators,
+                                bus=self.global_bus,
+                                source_sim_id=conn.source.sim_id,
+                                target_sim_id=conn.target.sim_id,
+                                target_time=event.timestamp,
+                            )
+                            target_sim.inputs[conn.target.port] = conn.apply_transform(value, ctx)
                             target_sim.step(0.0)
                             target_sim.record_output()
 
@@ -206,7 +214,14 @@ class Orchestrator:
             history = src_sim.get_output_history(
                 since=self.global_time - self._get_lookback(conn)
             )
-            value = StrategyEngine.resolve(conn, history, self.global_time)
+            ctx = TransformContext(
+                simulators=self.simulators,
+                bus=self.global_bus,
+                source_sim_id=conn.source.sim_id,
+                target_sim_id=conn.target.sim_id,
+                target_time=self.global_time,
+            )
+            value = StrategyEngine.resolve(conn, history, self.global_time, ctx)
             if value is not None:
                 tgt_sim.inputs[conn.target.port] = value
 
