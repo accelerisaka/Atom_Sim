@@ -3,6 +3,13 @@ FL3: Diffusion2D — 烟雾/CO 扩散仿真。
 物理规律：菲克扩散定律  ∂C/∂t = D ∇²C + S
 实现：二维有限差分，受障碍物（墙壁）影响。
 Natural DT = 0.2s
+
+端口契约 (Input Port Schema)
+----------------------------
+- smoke_source_rate  : ndarray[H, W] float, 单位 1/s
+    每格的产烟源强度；**由 S2S 总线上的 transform 从温度场换算而来**。
+    本原子不再接受原始温度场，不做任何阈值判断。
+- ventilation_status : float — 通风强度（0=关闭, 越大排烟越强）
 """
 
 from __future__ import annotations
@@ -47,14 +54,14 @@ class Diffusion2D(AtomicSimulator):
         C = self.state["smoke_density_field"]
         mask = self.state["passable_mask"]
 
-        fire_intensity = self.inputs.get("fire_intensity")
-        if fire_intensity is not None:
-            if isinstance(fire_intensity, np.ndarray):
-                # 温度超过 100°C 的区域产烟
-                source = np.where(fire_intensity > 100, (fire_intensity - 100) / 800.0, 0.0)
-                C += source * dt
-            elif isinstance(fire_intensity, (int, float)):
-                C += fire_intensity * 0.001 * dt
+        # source rate 已经是"产烟速率(1/s)"，温度→速率的换算在 transform 中完成
+        source_rate = self.inputs.get("smoke_source_rate")
+        if source_rate is not None:
+            rate = np.asarray(source_rate, dtype=np.float64)
+            if rate.shape == C.shape:
+                C = C + rate * dt
+            elif rate.ndim == 0:
+                C = C + float(rate) * dt
 
         # 有限差分扩散
         r = self.D * dt / (self.cell_size ** 2)
@@ -97,6 +104,6 @@ class Diffusion2D(AtomicSimulator):
 
     def schema(self) -> Dict[str, Any]:
         return {
-            "inputs": ["fire_intensity", "ventilation_status"],
+            "inputs": ["smoke_source_rate", "ventilation_status"],
             "outputs": ["smoke_density_field", "visibility_field"],
         }

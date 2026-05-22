@@ -23,6 +23,7 @@ from core.protocol import (
     PortAddress,
     S2SConnection,
 )
+from core.transforms import TRANSFORM_REGISTRY, TransformContext, get_transform
 
 from atoms.physical.td1_heat import HeatConduction
 from atoms.physical.fl3_smoke import Diffusion2D
@@ -76,11 +77,32 @@ def _build_simulator(sim_id: str, cfg: Dict[str, Any]) -> AtomicSimulator:
 
 
 def _build_connection(cfg: Dict[str, Any]) -> S2SConnection:
+    """
+    按 YAML 配置构建一条 S2S 连接。
+
+    要求 YAML 里每条连接都显式声明 `transform: <name>`，name 必须是
+    `core.transforms.TRANSFORM_REGISTRY` 中已注册的键。
+    若缺失或未注册，直接报错——强制"形式化"，避免再出现隐性耦合。
+    """
+    conn_id = cfg["connection_id"]
+    transform_name = cfg.get("transform")
+    if transform_name is None:
+        raise ValueError(
+            f"Connection '{conn_id}' is missing required field 'transform'. "
+            f"Every S2S connection must declare a transform (use 'identity' "
+            f"for pure port-renaming). Available transforms: "
+            f"{sorted(TRANSFORM_REGISTRY.keys())}"
+        )
+    transform_fn = get_transform(transform_name)  # KeyError if unregistered
+
     return S2SConnection(
-        connection_id=cfg["connection_id"],
+        connection_id=conn_id,
         source=PortAddress(cfg["source"]["sim_id"], cfg["source"]["port"]),
         target=PortAddress(cfg["target"]["sim_id"], cfg["target"]["port"]),
         strategy=ExchangeStrategy(cfg["strategy"]),
+        transform=transform_fn,
+        transform_name=transform_name,
+        description=cfg.get("description", ""),
     )
 
 
@@ -249,11 +271,24 @@ def _setup_temperature_spike_monitor(orch: Orchestrator) -> None:
 
     td1.step = _patched_step  # type: ignore
 
+    # 事件桥也必须经过已注册 Transform，不允许把原始 payload 直接塞进下游。
+    # 使用 per-agent 版本的 transform，与 td1_temp_to_pd3 主通道保持一致：
+    # 传入 TransformContext，让 transform 能读到 CM1.positions 并在每个个体位置采样。
+    temp_to_danger = get_transform("temperature_field_to_per_agent_danger")
+
     def _handle_spike(event: EventMessage) -> None:
         pd3: EmotionAppraisal = orch.simulators.get("PD3")  # type: ignore
         if pd3 is None:
             return
-        pd3.inputs["local_temperature"] = event.payload.get("temperature_field")
+        raw_field = event.payload.get("temperature_field")
+        ctx = TransformContext(
+            simulators=orch.simulators,
+            bus=orch.global_bus,
+            source_sim_id="TD1",
+            target_sim_id="PD3",
+            target_time=event.timestamp,
+        )
+        pd3.inputs["local_danger"] = temp_to_danger(raw_field, ctx)
         pd3.step(0.0)
         pd3.record_output()
 
