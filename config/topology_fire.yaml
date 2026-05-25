@@ -1,0 +1,273 @@
+# ============================================================
+# 建筑火灾疏散联合仿真 — S2S 拓扑连接配置
+# ============================================================
+#
+# 重要约定：
+#   每一条 S2S 连接都必须显式声明 `transform` 字段，
+#   该字段的取值必须是 core/transforms.py 中 TRANSFORM_REGISTRY
+#   已注册的名字。即使源/目标数据形式一致（仅端口重命名），
+#   也必须声明 transform: identity，以保证系统内不存在隐性耦合。
+#
+#   所有跨原子的单位换算、场聚合、形状适配、语义翻译，
+#   都在 transform 函数里完成，原子仿真器自身的 step()
+#   不应出现任何针对"源仿真器"的硬编码转换。
+# ============================================================
+
+# ----------------------------------------------------------
+# 时间分组
+# ----------------------------------------------------------
+time_groups:
+  micro:
+    dt: 0.02
+    description: "高频物理碰撞"
+  meso:
+    dt: 0.1
+    description: "中频流体/行为"
+  macro:
+    dt: 0.5
+    description: "低频心理/热传导"
+  event:
+    dt: 0.0
+    description: "事件驱动"
+
+# ----------------------------------------------------------
+# 仿真器注册
+# ----------------------------------------------------------
+simulators:
+  TD1:
+    class: "atoms.physical.HeatConduction"
+    group: macro
+    params:
+      grid_size: [50, 50]
+      cell_size: 0.5
+      alpha: 0.02
+
+  FL3:
+    class: "atoms.physical.Diffusion2D"
+    group: meso
+    params:
+      grid_size: [50, 50]
+      cell_size: 0.5
+      diffusion_coeff: 0.05
+
+  FL4:
+    class: "atoms.physical.CrowdFluid"
+    group: meso
+    params:
+      grid_size: [50, 50]
+      cell_size: 0.5
+
+  CM1:
+    class: "atoms.physical.RigidBody2D"
+    group: micro
+    params:
+      num_agents: 200
+      world_size: [25.0, 25.0]
+
+  P6:
+    class: "atoms.physical.BottleneckGate"
+    group: meso
+    params:
+      capacity: 1.5
+      gate_width: 1.2
+      critical_density: 5.0
+
+  PD3:
+    class: "atoms.social.EmotionAppraisal"
+    group: macro
+    params:
+      num_agents: 200
+
+  BP6:
+    class: "atoms.social.StressPerformanceCurve"
+    group: macro
+    params:
+      num_agents: 200
+
+  S2:
+    class: "atoms.social.HerdBehavior"
+    group: meso
+    params:
+      num_agents: 200
+      neighbor_radius: 3.0
+
+  SD4:
+    class: "atoms.social.BystanderEffect"
+    group: event
+    params:
+      num_agents: 200
+
+  BP5:
+    class: "atoms.social.AttentionAllocator"
+    group: meso
+    params:
+      num_agents: 200
+
+# ----------------------------------------------------------
+# S2S 连接拓扑
+# ----------------------------------------------------------
+# 每条连接字段：
+#   connection_id : 唯一 ID（也会被 transforms.py 反向索引）
+#   source/target : 端口地址
+#   strategy      : ZOH / AVG / INTERP / EVENT
+#   transform     : core.transforms 中已注册的变换名
+#   description   : 物理/语义含义
+# ----------------------------------------------------------
+connections:
+
+  # ========== 1. 火灾环境 → 心理 ==========
+
+  - connection_id: td1_temp_to_pd3
+    source: { sim_id: TD1, port: temperature_field }
+    target: { sim_id: PD3, port: local_danger }
+    strategy: AVG
+    transform: temperature_field_to_per_agent_danger
+    description: "温度场(°C, 2D) → 逐个体危险度 ndarray[n] ∈ [0,1] (按 CM1.positions 采样, AVG 防高频噪音)"
+
+  - connection_id: fl3_smoke_to_pd3
+    source: { sim_id: FL3, port: smoke_density_field }
+    target: { sim_id: PD3, port: smoke_exposure }
+    strategy: AVG
+    transform: smoke_field_to_per_agent_exposure
+    description: "烟雾浓度场(2D) → 逐个体烟雾暴露度 ndarray[n] (按 CM1.positions 采样)"
+
+  - connection_id: fl3_vis_to_pd3
+    source: { sim_id: FL3, port: visibility_field }
+    target: { sim_id: PD3, port: exit_visibility }
+    strategy: AVG
+    transform: visibility_field_to_per_agent_visibility
+    description: "能见度场(2D) → 逐个体可见度 ndarray[n] (按 CM1.positions 采样)"
+
+  - connection_id: fl3_vis_to_bp5
+    source: { sim_id: FL3, port: smoke_density_field }
+    target: { sim_id: BP5, port: smoke_exposure }
+    strategy: ZOH
+    transform: smoke_field_to_per_agent_exposure
+    description: "烟雾浓度场 → 逐个体暴露度 → 逐个体注意力干扰"
+
+  # ========== 2. 心理 → 决策/物理 ==========
+
+  - connection_id: pd3_panic_to_bp6
+    source: { sim_id: PD3, port: panic_level }
+    target: { sim_id: BP6, port: panic_level }
+    strategy: ZOH
+    transform: identity
+    description: "恐慌值 → 压力表现曲线 (数据形式相同)"
+
+  - connection_id: bp6_eff_to_cm1
+    source: { sim_id: BP6, port: cognitive_efficiency_multiplier }
+    target: { sim_id: CM1, port: cognitive_efficiency }
+    strategy: INTERP
+    transform: identity
+    description: "认知效率 → 物理运动 (端口重命名, INTERP 防阶跃)"
+
+  - connection_id: s2_bias_to_cm1
+    source: { sim_id: S2, port: herd_velocity_bias }
+    target: { sim_id: CM1, port: herd_bias }
+    strategy: ZOH
+    transform: identity
+    description: "从众偏置 → 叠加至出口驱动速度 (端口重命名)"
+
+  # ========== 3. 社会互动 ==========
+
+  - connection_id: cm1_pos_to_s2
+    source: { sim_id: CM1, port: positions }
+    target: { sim_id: S2, port: agent_positions }
+    strategy: ZOH
+    transform: identity
+    description: "位置 → 从众行为邻居探测 (端口重命名)"
+
+  - connection_id: cm1_vel_to_s2
+    source: { sim_id: CM1, port: velocities }
+    target: { sim_id: S2, port: neighbor_velocities }
+    strategy: ZOH
+    transform: identity
+    description: "速度 → 从众行为参考 (端口重命名)"
+
+  - connection_id: bp5_mask_to_s2
+    source: { sim_id: BP5, port: perception_mask }
+    target: { sim_id: S2, port: individual_confidence }
+    strategy: ZOH
+    transform: identity
+    description: "感知能力 → 个体信心 (端口重命名)"
+
+  - connection_id: cm1_fallen_to_sd4
+    source: { sim_id: CM1, port: fallen }
+    target: { sim_id: SD4, port: fallen_mask }
+    strategy: EVENT
+    transform: identity
+    description: "跌倒事件 → 旁观者效应 (事件驱动, 端口重命名)"
+
+  - connection_id: cm1_active_to_sd4
+    source: { sim_id: CM1, port: active }
+    target: { sim_id: SD4, port: active_mask }
+    strategy: EVENT
+    transform: identity
+    description: "活跃状态 → 旁观者效应 (端口重命名)"
+
+  - connection_id: cm1_pos_to_sd4
+    source: { sim_id: CM1, port: positions }
+    target: { sim_id: SD4, port: agent_positions }
+    strategy: EVENT
+    transform: identity
+    description: "位置 → 旁观者效应 (端口重命名)"
+
+  # ========== 4. 物理反馈循环 ==========
+
+  - connection_id: cm1_pos_to_fl4
+    source: { sim_id: CM1, port: positions }
+    target: { sim_id: FL4, port: agent_positions }
+    strategy: ZOH
+    transform: identity
+    description: "个体位置 → 宏观密度更新 (端口重命名)"
+
+  - connection_id: fl4_density_to_p6
+    source: { sim_id: FL4, port: density_map }
+    target: { sim_id: P6, port: density }
+    strategy: ZOH
+    transform: identity
+    description: "密度场 → 瓶颈限流 (端口重命名)"
+
+  - connection_id: p6_constraint_to_cm1
+    source: { sim_id: P6, port: flow_constraint }
+    target: { sim_id: CM1, port: flow_constraint }
+    strategy: ZOH
+    transform: identity
+    description: "限速因子 → 物理运动约束 (数据形式相同)"
+
+  - connection_id: td1_heat_to_fl3
+    source: { sim_id: TD1, port: temperature_field }
+    target: { sim_id: FL3, port: smoke_source_rate }
+    strategy: ZOH
+    transform: temperature_field_to_smoke_source_rate
+    description: "温度场(°C) → 产烟速率场(1/s) [阈值+归一化在 transform 里完成]"
+
+# ----------------------------------------------------------
+# 场景初始条件
+# ----------------------------------------------------------
+scenario:
+  duration: 60.0           # 仿真时长 (秒)
+  snapshot_interval: 1   # 快照间隔 (秒)
+
+  ignition_points:
+    - [10, 10, 800]        # (row, col, temperature)
+    - [12, 11, 600]
+
+  # 出口位于外墙缺口内侧 1.5m 处，避开墙壁排斥力场 (A_WALL 在 <1m 时显著)
+  exits:
+    - [1.5, 12.5]          # 出口1: 左墙缺口 (世界坐标)
+    - [23.5, 12.5]         # 出口2: 右墙缺口
+
+  walls:
+    # 外墙 (在 y=12.5 处为左右墙开设 1.6m 宽缺口)
+    - [[0, 0], [25, 0]]                # 下外墙
+    - [[25, 0], [25, 11.7]]            # 右外墙下段
+    - [[25, 13.3], [25, 25]]           # 右外墙上段
+    - [[25, 25], [0, 25]]              # 上外墙
+    - [[0, 25], [0, 13.3]]             # 左外墙上段
+    - [[0, 11.7], [0, 0]]              # 左外墙下段
+    # 内墙 (走廊)
+    - [[10, 0], [10, 10]]
+    - [[10, 15], [10, 25]]
+    - [[15, 0], [15, 10]]
+    - [[15, 15], [15, 25]]

@@ -1,0 +1,44 @@
+# 角色与任务
+你是一个熟悉系统工程与多智能体联合仿真的高级架构师。当前项目中包含一个基于 `AtomicSimulator` 的多物理场+社会心理耦合仿真架构。
+现在，我们需要在这个架构上新增一个全新的联合仿真场景：[1]。
+
+# 场景背景
+[2]
+
+# 你的设计任务
+请你基于上述背景，**自行思考并设计**完成这个闭环场景所需的“物理原子(Physical Atoms)”与“社会/心理原子(Social Atoms)”，以及它们之间的 S2S 连接拓扑。
+- 你可以评估现有的原子仿真器与它们之间的连接拓扑是否可以复用。
+- 如果已有的原子仿真器可以借鉴但不能完全复用，你可以新建一个继承该仿真器的原子仿真器
+- 在复用已有仿真器之外，你需要设计能联合仿真这个场景的原子仿真器们。
+
+已有的项目包含了原子仿真器相互连接与联合仿真如何推进的协议，在/core下，你需要按照这个协议编写联合仿真环境
+
+# 绝对严格的架构规则（必须遵守）
+在编写代码时，你必须严格遵守以下规则。
+
+1. **禁止修改原文件**：绝不能修改 `atoms/` 下现有的任何原子仿真器，也不能修改 `main.py` 和 `core/` 下的核心引擎（除了 `transforms.py` 允许追加）。需要复用但需微调时，请新建仿真器。
+2. **原子绝对解耦**：新建的原子必须继承自 `core.base.AtomicSimulator`。原子的 `step(dt)` 内部**绝对不能**假设外部输入数据的来源、形状或单位，也不允许在原子内部做空间场采样或格式转换。输入端口直接读取 `self.inputs.get()`，只专注于本领域的纯粹计算。
+3. **数据转换集中化 (Transform 协议)**：所有跨原子仿真器交互时的数据翻译，**必须且只能**写在 `core/transforms.py` 中。
+   - 使用 `@register_transform` 装饰器追加在文件末尾。
+   - 如果需要跨仿真器读取数据（如位置），必须通过传入二参函数的 `ctx: TransformContext` 进行读取（如 `ctx.sim_state('EC1', 'positions')`）。
+4. **形式化的 YAML 拓扑**：必须创建一份全新的 `config/topology_xxx.yaml`，xxx为你给联合仿真环境简要起的英文称号。其中 `connections` 列表里的**每一条** S2S 连接，都必须显式声明 `transform` 字段，具体要求可以仿照已有的topology.yaml。
+
+# 执行步骤要求
+请按以下顺序输出你的思考与代码：
+
+**Step 1. 架构设计思考 (Text)**
+- 简述你设计的联合仿真拓扑图（包含哪些原子，分别处于什么时间分组 time_groups）。
+- 简述需要用到哪些数据转换逻辑 (Transforms)。
+
+**Step 2. 复用已有原子仿真器或编写新的原子仿真器 (Python)**
+- 按类别存放在 `atoms/physical/` 或 `atoms/social/` 目录下。
+
+**Step 3. 追加 Transforms (Python)**
+- 给出需要追加到 `core/transforms.py` 文件末尾的代码。
+
+**Step 4. 编写拓扑配置 (YAML)**
+- 输出完整的 `config/topology_xxx.yaml`。设定各仿真的 `strategy` (ZOH, AVG, INTERP, EVENT)。
+
+**Step 5. 编写运行与可视化入口 (Python)**
+- 新建 `run_xxx.py`，xxx应该与`config/topology_xxx.yaml`的xxx保持一致，加载 YAML，运行 `Orchestrator`。
+- 从 `orch.history` 提取快照数据，使用 `matplotlib` 编写一个自定义的动态可视化面板（或导出 GIF和mp4），直观展示联合仿真的过程与各原子仿真器的运行情况。

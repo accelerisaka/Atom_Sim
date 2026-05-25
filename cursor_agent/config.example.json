@@ -1,0 +1,14 @@
+{
+  "apiKey": "在此处填入你的 Cursor API Key (cursor_...) 或留空并改用环境变量 CURSOR_API_KEY",
+  "model": {
+    "id": "composer-2.5",
+    "params": [
+      { "id": "thinking", "value": "high" }
+    ]
+  },
+  "projectRoot": "..",
+  "promptTemplatePath": "./prompt_template.txt",
+  "settingSources": ["all"],
+  "showThinking": true,
+  "showToolCalls": true
+}

@@ -32,7 +32,7 @@ S2S 连接数据变换库（Transform Library）
 新增一条连接的流程
 ------------------
 1. 在此文件中定义并 `@register_transform(...)` 装饰一个变换函数；
-2. 在 `config/topology.yaml` 对应连接下声明 `transform: <name>`；
+2. 在该仿真环境的`config/topology_xxx.yaml` 对应连接下声明 `transform: <name>`；
 3. `main.py._build_connection` 会自动按名解析并注入到 `S2SConnection.transform`。
 
 所有公开 API

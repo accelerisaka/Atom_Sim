@@ -10,6 +10,7 @@
 - [核心特性](#核心特性)
 - [项目结构](#项目结构)
 - [快速开始](#快速开始)
+- [Web 可视化前端](#web-可视化前端)
 - [架构设计](#架构设计)
 - [仿真器清单](#仿真器清单)
 - [S2S 拓扑连接](#s2s-拓扑连接)
@@ -90,6 +91,49 @@ python main.py -c config/topology.yaml
 运行后将在 `output/` 目录下生成：
 - `history.json` — 全量仿真状态历史，可供前端可视化渲染
 - `frame_XXXX.png` — 四面板快照图像（温度/烟雾/人群/恐慌）
+
+---
+
+## Web 可视化前端
+
+仓库提供了一套 React + FastAPI 的可视化界面，把"已有原子仿真器 → 新建联合仿真环境 → 配置 → 运行 → 播放结果"整条链路串起来。
+
+```
+frontend/   React + Vite + TypeScript + @xyflow/react
+backend/    FastAPI （扫 atoms、解析 topology、spawn cursor_agent/run_xxx.py、WebSocket 流式日志）
+```
+
+### 一键启动（Windows / PowerShell）
+
+```powershell
+# 仅首次需要 -Install
+pwsh ./start_web.ps1 -Install
+# 之后
+pwsh ./start_web.ps1
+# 浏览器打开 http://localhost:5173
+```
+
+也可分两步：
+
+```powershell
+# 后端
+pip install -r backend/requirements.txt
+python -m uvicorn backend.main:app --reload --port 8000
+
+# 前端
+cd frontend
+npm install
+npm run dev
+```
+
+### 功能
+
+- **首页**：圆圈网格展示 `atoms/{physical,social}/` 下全部原子仿真器；点击圆显示该文件的开头 docstring；三个入口卡片：`+ 生成联合仿真环境`、`run_fire` 演示、`run_grid` 演示。
+- **生成新场景**：输入场景名 + 多行背景 → 调用 `cursor_agent`（已被改造为支持 `--non-interactive` CLI）→ 流式日志 → 完成后自动识别新生成的 `config/topology_<xxx>.yaml`。
+- **场景视图**：用 `@xyflow/react` 渲染该拓扑的 simulators 与 S2S 连接；simulators 按"复用 / 继承 / 新增"三种颜色标记；点击圆/箭头在右侧面板显示详情；运行按钮弹出 scenario 参数配置 → 运行 → 自动播放 `output_<name>/` 中的 GIF/MP4。
+- **新增的原子会回流到首页**：每次完成生成后，首页 `刷新` 即可看到新原子。
+
+详见 [`frontend/README.md`](frontend/README.md) 与 [`backend/README.md`](backend/README.md)。
 
 ---
 
