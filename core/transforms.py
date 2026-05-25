@@ -32,7 +32,7 @@ S2S 连接数据变换库（Transform Library）
 新增一条连接的流程
 ------------------
 1. 在此文件中定义并 `@register_transform(...)` 装饰一个变换函数；
-2. 在 `config/topology.yaml` 对应连接下声明 `transform: <name>`；
+2. 在 该仿真的`config/topology.yaml` 对应连接下声明 `transform: <name>`；
 3. `main.py._build_connection` 会自动按名解析并注入到 `S2SConnection.transform`。
 
 所有公开 API
@@ -562,3 +562,209 @@ def temperature_field_to_per_household_temp(
         return None
     cell_size = _get_grid_cell_size(ctx, "TD1", fallback=1.0)
     return _sample_field_at_positions(field_T, positions, cell_size, default=30.0)
+
+
+# =============================================================================
+# 行人过马路从众心理场景（Pedestrian Crosswalk Conformity）追加 Transforms
+# =============================================================================
+
+
+def _get_pedestrian_positions(
+    ctx: Optional[TransformContext], sim_id: str = "PED1"
+) -> Optional[np.ndarray]:
+    """优先从最新 PED1.state 读取行人位置；回落到 bus 快照。"""
+    if ctx is None:
+        return None
+    pos = ctx.sim_state(sim_id, "positions")
+    if pos is None:
+        bus = ctx.bus.get(sim_id, {}) if ctx.bus else {}
+        pos = bus.get("positions")
+    return pos
+
+
+def _pedestrian_count(ctx: Optional[TransformContext], sim_id: str = "PED1") -> int:
+    if ctx is None:
+        return 40
+    sim = ctx.simulators.get(sim_id)
+    if sim is None:
+        return 40
+    return int(getattr(sim, "num_agents", 40))
+
+
+@register_transform(
+    name="broadcast_scalar_to_per_agent",
+    source_schema="float scalar",
+    target_schema="ndarray[n] float",
+    description=(
+        "将标量广播为逐个体数组。需要 ctx: 目标仿真器 num_agents "
+        "(默认 PED1.num_agents)。"
+    ),
+    connections=[
+        "tl1_ped_signal_to_pc1",
+        "pp1_jaywalk_to_pc1",
+        "pp1_patience_to_pc1",
+    ],
+)
+def broadcast_scalar_to_per_agent(
+    value: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    n = _pedestrian_count(ctx, "PED1")
+    scalar = float(np.asarray(value, dtype=np.float64).ravel()[0])
+    return np.full(n, scalar, dtype=np.float64)
+
+
+@register_transform(
+    name="vehicle_positions_to_per_pedestrian_danger",
+    source_schema="ndarray[m, 2] float, 车辆世界坐标",
+    target_schema="ndarray[n] float in [0, 1]",
+    description=(
+        "根据每辆活跃车辆与每个行人的最近距离，计算被车撞击危险度。\n"
+        "需要 ctx: PED1.state['positions']、VEH1.state['active']。\n"
+        "公式：danger_i = max_j exp(-(d_ij - 1.5) / 2)，d<1.5m 时趋近 1。"
+    ),
+    connections=[
+        "veh1_pos_to_pd3_danger",
+        "veh1_pos_to_pc1_danger",
+    ],
+)
+def vehicle_positions_to_per_pedestrian_danger(
+    veh_positions: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    ped_pos = _get_pedestrian_positions(ctx, "PED1")
+    if veh_positions is None or ped_pos is None:
+        return None
+
+    vp = np.asarray(veh_positions, dtype=np.float64)
+    pp = np.asarray(ped_pos, dtype=np.float64)
+    n = pp.shape[0]
+
+    active = ctx.sim_state("VEH1", "active") if ctx else None
+    if active is not None:
+        active = np.asarray(active, dtype=bool)
+        if active.shape[0] == vp.shape[0]:
+            vp = vp[active]
+
+    if vp.ndim != 2 or vp.shape[0] == 0:
+        return np.zeros(n, dtype=np.float64)
+
+    danger = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        dists = np.linalg.norm(vp - pp[i], axis=1)
+        d_min = float(np.min(dists))
+        danger[i] = float(np.clip(np.exp(-(d_min - 1.5) / 2.0), 0.0, 1.0))
+
+    return danger
+
+
+@register_transform(
+    name="ped_signal_to_per_agent_visibility",
+    source_schema="float in [0, 1], 行人信号",
+    target_schema="ndarray[n] float in [0, 1]",
+    description=(
+        "行人信号灯映射为逐个体可见度/信号感知度。\n"
+        "绿灯=1.0（信号清晰），红灯=0.35（仍可看到红灯但非通行许可）。\n"
+        "需要 ctx: PED1.num_agents。"
+    ),
+    connections=["tl1_ped_signal_to_pd3_visibility"],
+)
+def ped_signal_to_per_agent_visibility(
+    ped_signal: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    if ped_signal is None:
+        return None
+    n = _pedestrian_count(ctx, "PED1")
+    sig = float(np.asarray(ped_signal, dtype=np.float64).ravel()[0])
+    vis = 0.35 + 0.65 * sig
+    return np.full(n, vis, dtype=np.float64)
+
+
+@register_transform(
+    name="vehicle_count_to_traffic_noise",
+    source_schema="ndarray[m, 2] float, 车辆位置",
+    target_schema="float in [0, 1]",
+    description=(
+        "根据停止线附近活跃车辆数估计交通噪声水平（标量）。\n"
+        "需要 ctx: VEH1.state['active']、VEH1.stop_line_x。"
+    ),
+    connections=["veh1_pos_to_bp5_noise"],
+)
+def vehicle_count_to_traffic_noise(
+    veh_positions: Any, ctx: Optional[TransformContext]
+) -> float:
+    if veh_positions is None:
+        return 0.0
+    vp = np.asarray(veh_positions, dtype=np.float64)
+    active = ctx.sim_state("VEH1", "active") if ctx else None
+    stop_x = float(ctx.sim_attr("VEH1", "stop_line_x", 12.0)) if ctx else 12.0
+
+    if active is not None:
+        active = np.asarray(active, dtype=bool)
+        if active.shape[0] == vp.shape[0]:
+            vp = vp[active]
+
+    if vp.ndim != 2 or vp.shape[0] == 0:
+        return 0.0
+
+    near = np.sum(np.abs(vp[:, 0] - stop_x) < 8.0)
+    return float(np.clip(near / 4.0, 0.0, 1.0))
+
+
+@register_transform(
+    name="density_field_to_per_agent_crowd_exposure",
+    source_schema="ndarray[H, W] float, 人/m²",
+    target_schema="ndarray[n] float in [0, 1]",
+    description=(
+        "在每位行人位置采样等待区密度，映射为拥挤暴露度。\n"
+        "需要 ctx: PED1.positions、FL4.cell_size。\n"
+        "公式：exposure_i = clip(density(pos_i) / 6, 0, 1)"
+    ),
+    connections=["fl4_density_to_bp5_smoke"],
+)
+def density_field_to_per_agent_crowd_exposure(
+    density_map: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_pedestrian_positions(ctx, "PED1")
+    if density_map is None or positions is None:
+        return None
+    cell_size = _get_grid_cell_size(ctx, "FL4", fallback=0.5)
+    sampled = _sample_field_at_positions(density_map, positions, cell_size, default=0.0)
+    if sampled is None:
+        return None
+    return np.clip(sampled / 6.0, 0.0, 1.0)
+
+
+@register_transform(
+    name="crossing_state_to_neighbors_crossing_ratio",
+    source_schema="ndarray[n] bool, 行人过街状态",
+    target_schema="ndarray[n] float in [0, 1]",
+    description=(
+        "统计每位行人邻居中正在过街者的比例（从众信号）。\n"
+        "需要 ctx: PED1.positions、S2.neighbor_radius。"
+    ),
+    connections=["ped1_crossing_to_pc1_herd_ratio"],
+)
+def crossing_state_to_neighbors_crossing_ratio(
+    crossing: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_pedestrian_positions(ctx, "PED1")
+    if crossing is None or positions is None:
+        return None
+
+    cross = np.asarray(crossing, dtype=bool).ravel()
+    pos = np.asarray(positions, dtype=np.float64)
+    n = min(cross.shape[0], pos.shape[0])
+
+    radius = float(ctx.sim_attr("S2", "neighbor_radius", 3.0)) if ctx else 3.0
+    ratio = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        dists = np.linalg.norm(pos[:n] - pos[i], axis=1)
+        neighbors = (dists < radius) & (dists > 1e-6)
+        if not np.any(neighbors):
+            continue
+        ratio[i] = float(np.mean(cross[:n][neighbors]))
+
+    return ratio
+

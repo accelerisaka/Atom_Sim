@@ -1,0 +1,383 @@
+# ============================================================
+# 行人过马路从众心理联合仿真 — S2S 拓扑连接配置
+# ============================================================
+#
+# 场景代号: crosswalk
+# 每条 S2S 连接均显式声明 transform 字段。
+# ============================================================
+
+time_groups:
+  micro:
+    dt: 0.02
+    description: "高频物理：行人/车辆运动、碰撞检测"
+  meso:
+    dt: 0.1
+    description: "中频：信号灯、从众、决策、密度"
+  macro:
+    dt: 0.5
+    description: "低频：情绪评估、压力曲线、性格档案"
+  event:
+    dt: 0.0
+    description: "事件驱动：碰撞后果"
+
+simulators:
+  TL1:
+    class: "atoms.physical.TrafficLightController"
+    group: meso
+    params:
+      ped_green_duration: 12.0
+      ped_red_duration: 22.0
+      initial_phase: "PED_RED"
+
+  VEH1:
+    class: "atoms.physical.LaneVehicleTraffic"
+    group: micro
+    params:
+      num_vehicles: 6
+      lane_y: 10.0
+      cruise_speed: 9.0
+      stop_line_x: 12.0
+      world_size: [30.0, 20.0]
+
+  PED1:
+    class: "atoms.physical.PedestrianCrossingBody"
+    group: micro
+    params:
+      num_agents: 40
+      world_size: [30.0, 20.0]
+      default_speed: 1.2
+      seed: 42
+
+  CL1:
+    class: "atoms.physical.CollisionDetector"
+    group: micro
+    params:
+      num_pedestrians: 40
+      num_vehicles: 6
+      ped_radius: 0.25
+      veh_radius: 1.2
+      impulse_magnitude: 30.0
+
+  PP1:
+    class: "atoms.social.PedestrianProfile"
+    group: macro
+    params:
+      num_agents: 40
+      jaywalk_range: [0.05, 0.95]
+      seed: 77
+
+  PC1:
+    class: "atoms.social.CrosswalkDecision"
+    group: meso
+    params:
+      num_agents: 40
+      cross_speed: 1.2
+      herd_cross_threshold: 0.3
+
+  S2:
+    class: "atoms.social.HerdBehavior"
+    group: meso
+    params:
+      num_agents: 40
+      neighbor_radius: 2.5
+      max_bias_magnitude: 1.0
+
+  BP5:
+    class: "atoms.social.AttentionAllocator"
+    group: meso
+    params:
+      num_agents: 40
+      smoke_attention_cost: 0.4
+      noise_attention_cost: 0.45
+
+  PD3:
+    class: "atoms.social.EmotionAppraisal"
+    group: macro
+    params:
+      num_agents: 40
+
+  BP6:
+    class: "atoms.social.StressPerformanceCurve"
+    group: macro
+    params:
+      num_agents: 40
+      optimal_arousal: 0.35
+      curve_width: 0.28
+
+  FL4:
+    class: "atoms.physical.CrowdFluid"
+    group: meso
+    params:
+      grid_size: [60, 40]
+      cell_size: 0.5
+
+  P6:
+    class: "atoms.physical.BottleneckGate"
+    group: meso
+    params:
+      capacity: 1.2
+      gate_width: 1.0
+      grid_size: [60, 40]
+      critical_density: 4.0
+
+connections:
+
+  # ========== 1. 交通信号 → 车辆 / 决策 / 心理 ==========
+
+  - connection_id: tl1_veh_signal_to_veh1
+    source: { sim_id: TL1, port: vehicle_signal }
+    target: { sim_id: VEH1, port: vehicle_signal }
+    strategy: ZOH
+    transform: identity
+    description: "车辆信号 → 车道车辆控制器"
+
+  - connection_id: tl1_ped_signal_to_pc1
+    source: { sim_id: TL1, port: pedestrian_signal }
+    target: { sim_id: PC1, port: pedestrian_signal }
+    strategy: ZOH
+    transform: broadcast_scalar_to_per_agent
+    description: "行人信号标量 → 逐个体信号数组"
+
+  - connection_id: tl1_ped_signal_to_pd3_visibility
+    source: { sim_id: TL1, port: pedestrian_signal }
+    target: { sim_id: PD3, port: exit_visibility }
+    strategy: ZOH
+    transform: ped_signal_to_per_agent_visibility
+    description: "行人信号 → 逐个体信号可见度"
+
+  # ========== 2. 性格档案 → 决策 ==========
+
+  - connection_id: pp1_jaywalk_to_pc1
+    source: { sim_id: PP1, port: jaywalk_tendency }
+    target: { sim_id: PC1, port: jaywalk_tendency }
+    strategy: ZOH
+    transform: identity
+    description: "闯红灯倾向 → 过街决策"
+
+  - connection_id: pp1_patience_to_pc1
+    source: { sim_id: PP1, port: patience }
+    target: { sim_id: PC1, port: patience }
+    strategy: ZOH
+    transform: identity
+    description: "耐心值 → 过街决策"
+
+  # ========== 3. 车辆 → 危险感知 ==========
+
+  - connection_id: veh1_pos_to_pd3_danger
+    source: { sim_id: VEH1, port: positions }
+    target: { sim_id: PD3, port: local_danger }
+    strategy: ZOH
+    transform: vehicle_positions_to_per_pedestrian_danger
+    description: "车辆位置 → 逐个体被车撞击危险度"
+
+  - connection_id: veh1_pos_to_pc1_danger
+    source: { sim_id: VEH1, port: positions }
+    target: { sim_id: PC1, port: local_danger }
+    strategy: ZOH
+    transform: vehicle_positions_to_per_pedestrian_danger
+    description: "车辆位置 → 逐个体过街危险度"
+
+  - connection_id: veh1_pos_to_bp5_noise
+    source: { sim_id: VEH1, port: positions }
+    target: { sim_id: BP5, port: noise_level }
+    strategy: ZOH
+    transform: vehicle_count_to_traffic_noise
+    description: "停止线附近车辆数 → 交通噪声标量"
+
+  # ========== 4. 心理链：情绪 → 压力 → 运动效率 ==========
+
+  - connection_id: pc1_frustration_to_pd3_smoke
+    source: { sim_id: PC1, port: waiting_frustration }
+    target: { sim_id: PD3, port: smoke_exposure }
+    strategy: ZOH
+    transform: identity
+    description: "等待焦虑 → 情绪评估烟雾暴露端口（语义映射：环境压力）"
+
+  - connection_id: pd3_panic_to_bp6
+    source: { sim_id: PD3, port: panic_level }
+    target: { sim_id: BP6, port: panic_level }
+    strategy: ZOH
+    transform: identity
+    description: "恐慌/焦虑 → 压力表现曲线"
+
+  - connection_id: pd3_panic_to_pc1_impatience
+    source: { sim_id: PD3, port: panic_level }
+    target: { sim_id: PC1, port: impatience }
+    strategy: ZOH
+    transform: identity
+    description: "焦虑水平 → 过街不耐烦"
+
+  - connection_id: bp6_eff_to_ped1
+    source: { sim_id: BP6, port: cognitive_efficiency_multiplier }
+    target: { sim_id: PED1, port: cognitive_efficiency }
+    strategy: INTERP
+    transform: identity
+    description: "认知效率 → 行人运动 (INTERP 平滑)"
+
+  # ========== 5. 注意力 / 从众社会环 ==========
+
+  - connection_id: fl4_density_to_bp5_smoke
+    source: { sim_id: FL4, port: density_map }
+    target: { sim_id: BP5, port: smoke_exposure }
+    strategy: ZOH
+    transform: density_field_to_per_agent_crowd_exposure
+    description: "等待区密度 → 逐个体拥挤干扰"
+
+  - connection_id: bp5_mask_to_s2
+    source: { sim_id: BP5, port: perception_mask }
+    target: { sim_id: S2, port: individual_confidence }
+    strategy: ZOH
+    transform: identity
+    description: "感知能力 → 个体信心（低则易从众）"
+
+  - connection_id: bp5_mask_to_pc1
+    source: { sim_id: BP5, port: perception_mask }
+    target: { sim_id: PC1, port: perception_mask }
+    strategy: ZOH
+    transform: identity
+    description: "感知能力 → 决策（影响闯红灯概率）"
+
+  - connection_id: ped1_pos_to_s2
+    source: { sim_id: PED1, port: positions }
+    target: { sim_id: S2, port: agent_positions }
+    strategy: ZOH
+    transform: identity
+    description: "行人位置 → 从众邻居探测"
+
+  - connection_id: ped1_vel_to_s2
+    source: { sim_id: PED1, port: velocities }
+    target: { sim_id: S2, port: neighbor_velocities }
+    strategy: ZOH
+    transform: identity
+    description: "行人速度 → 从众参考"
+
+  - connection_id: s2_bias_to_pc1
+    source: { sim_id: S2, port: herd_velocity_bias }
+    target: { sim_id: PC1, port: herd_velocity_bias }
+    strategy: ZOH
+    transform: identity
+    description: "从众速度偏置 → 过街决策"
+
+  - connection_id: s2_bias_to_ped1
+    source: { sim_id: S2, port: herd_velocity_bias }
+    target: { sim_id: PED1, port: herd_bias }
+    strategy: ZOH
+    transform: identity
+    description: "从众偏置 → 行人运动叠加"
+
+  - connection_id: ped1_crossing_to_pc1_herd_ratio
+    source: { sim_id: PED1, port: crossing }
+    target: { sim_id: PC1, port: neighbors_crossing_ratio }
+    strategy: ZOH
+    transform: crossing_state_to_neighbors_crossing_ratio
+    description: "邻居过街比例 → 从众决策输入"
+
+  - connection_id: ped1_waiting_to_pc1
+    source: { sim_id: PED1, port: waiting_time }
+    target: { sim_id: PC1, port: waiting_time }
+    strategy: ZOH
+    transform: identity
+    description: "等待时长 → 决策焦虑"
+
+  # ========== 6. 决策 → 物理运动 ==========
+
+  - connection_id: pc1_desired_vel_to_ped1
+    source: { sim_id: PC1, port: desired_velocity }
+    target: { sim_id: PED1, port: desired_velocity }
+    strategy: ZOH
+    transform: identity
+    description: "过街决策期望速度 → 行人动力学"
+
+  # ========== 7. 密度瓶颈反馈 ==========
+
+  - connection_id: ped1_pos_to_fl4
+    source: { sim_id: PED1, port: positions }
+    target: { sim_id: FL4, port: agent_positions }
+    strategy: ZOH
+    transform: identity
+    description: "行人位置 → 等待区密度场"
+
+  - connection_id: fl4_density_to_p6
+    source: { sim_id: FL4, port: density_map }
+    target: { sim_id: P6, port: density }
+    strategy: ZOH
+    transform: identity
+    description: "密度场 → 斑马线瓶颈"
+
+  - connection_id: p6_constraint_to_ped1
+    source: { sim_id: P6, port: flow_constraint }
+    target: { sim_id: PED1, port: flow_constraint }
+    strategy: ZOH
+    transform: identity
+    description: "瓶颈限速 → 行人运动"
+
+  # ========== 8. 碰撞检测链 ==========
+
+  - connection_id: ped1_pos_to_cl1
+    source: { sim_id: PED1, port: positions }
+    target: { sim_id: CL1, port: ped_positions }
+    strategy: ZOH
+    transform: identity
+    description: "行人位置 → 碰撞检测"
+
+  - connection_id: veh1_pos_to_cl1
+    source: { sim_id: VEH1, port: positions }
+    target: { sim_id: CL1, port: veh_positions }
+    strategy: ZOH
+    transform: identity
+    description: "车辆位置 → 碰撞检测"
+
+  - connection_id: ped1_active_to_cl1
+    source: { sim_id: PED1, port: active }
+    target: { sim_id: CL1, port: ped_active }
+    strategy: ZOH
+    transform: identity
+    description: "行人活跃状态 → 碰撞检测"
+
+  - connection_id: veh1_active_to_cl1
+    source: { sim_id: VEH1, port: active }
+    target: { sim_id: CL1, port: veh_active }
+    strategy: ZOH
+    transform: identity
+    description: "车辆活跃状态 → 碰撞检测"
+
+  - connection_id: cl1_impulse_to_ped1
+    source: { sim_id: CL1, port: hit_impulses }
+    target: { sim_id: PED1, port: external_impulses }
+    strategy: ZOH
+    transform: identity
+    description: "碰撞冲量 → 行人外部力"
+
+  - connection_id: cl1_new_hit_to_ped1_event
+    source: { sim_id: CL1, port: new_collisions }
+    target: { sim_id: PED1, port: fallen }
+    strategy: EVENT
+    transform: identity
+    description: "新碰撞事件 → 行人跌倒标记"
+
+scenario:
+  duration: 90.0
+  snapshot_interval: 0.5
+
+  world_size: [30.0, 20.0]
+  crosswalk:
+    x_range: [12.0, 18.0]
+    y_range: [8.5, 11.5]
+    north_target_y: 14.0
+
+  # 道路区域与斑马线
+  road_y: 10.0
+  stop_line_x: 12.0
+
+  # 行人墙壁（限制在人行道与斑马线区域）
+  walls:
+    - [[0, 8.0], [12.0, 8.0]]
+    - [[18.0, 8.0], [30.0, 8.0]]
+    - [[0, 11.5], [12.0, 11.5]]
+    - [[18.0, 11.5], [30.0, 11.5]]
+    - [[0, 0], [0, 20.0]]
+    - [[30.0, 0], [30.0, 20.0]]
+
+  # 北侧目标点（过街完成后）
+  exits:
+    - [15.0, 14.0]

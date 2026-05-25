@@ -18,3 +18,12 @@ output/history.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# Web 子工程
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# 后端运行时产物
+config/_runtime_*.yaml
+

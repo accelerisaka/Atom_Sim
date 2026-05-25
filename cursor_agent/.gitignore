@@ -1,0 +1,9 @@
+node_modules/
+config.json
+dist/
+*.log
+.env
+last_run.json
+.background.tmp.txt
+_scenario_manifests/
+
