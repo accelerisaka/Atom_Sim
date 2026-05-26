@@ -105,16 +105,10 @@ export default function ScenarioPage() {
       id: c.connection_id,
       source: c.source_sim,
       target: c.target_sim,
-      label: c.transform,
       animated: c.strategy === "EVENT",
       markerEnd: { type: MarkerType.ArrowClosed, color: "#6b7488" },
       selected: sel.kind === "edge" && sel.id === c.connection_id,
       style: c.strategy === "EVENT" ? { strokeDasharray: "4 4" } : undefined,
-      labelStyle: { fontSize: 10 },
-      labelBgStyle: {
-        fill: "var(--bg-elev)",
-        stroke: "var(--border)",
-      },
     }));
   }, [detail, sel]);
 

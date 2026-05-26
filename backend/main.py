@@ -39,9 +39,10 @@ from pydantic import BaseModel, Field
 
 from backend.services.atom_scanner import scan_all_atoms
 from backend.services.classifier import classify_simulators
-from backend.services.manifest import load_manifest, record_generation
+from backend.services.manifest import record_generation
 from backend.services.process_manager import JobState, process_manager
 from backend.services.snapshot import diff_atoms, snapshot_atoms
+from backend.services.topology_order import baseline_for
 from backend.services.topology_parser import (
     find_topology_path,
     list_topologies,
@@ -116,10 +117,12 @@ async def get_scenario(name: str) -> Dict[str, Any]:
     topo = load_topology(name)
     if topo is None:
         raise HTTPException(404, detail=f"scenario '{name}' not found")
-    # 若该场景由 cursor_agent 生成过，则使用持久化的基线做分类，
-    # 这样刷新页面后仍能看到 reused / inherited / new。
-    manifest = load_manifest(name)
-    pre_snap = set(manifest["baseline_atom_files"]) if manifest else None
+    # 原子标识严格绑定到联合仿真环境：基线 = 该场景之前所有场景
+    # 引用过的原子文件并集。fire (第1位) 基线为空 → 其原子全部为
+    # 新增/继承；grid (第2位) 基线 = fire 引用的原子文件 → 共用的
+    # TD1 为复用，其余电网新原子为新增/继承；新生成的场景按 manifest
+    # 中 generated_at 时间排在内置场景之后。详见 topology_order.py。
+    pre_snap = baseline_for(name)
     classification = classify_simulators(topo["simulators"], pre_snapshot=pre_snap)
     atoms = {a["sim_id"]: a for a in scan_all_atoms()}
     atoms_by_class = {a["class_name"]: a for a in atoms.values()}
