@@ -1,0 +1,262 @@
+# ============================================================
+# 地铁站有毒重气体泄漏 + 智能排风疏散 — S2S 拓扑连接配置
+# ============================================================
+#
+# 场景代号: subway_gas
+# 运行入口: run_subway_gas.py
+#
+# 闭环数据流:
+#   FL5(重气体扩散) ↔ VT1(智能排风) — 物理反馈
+#   FL5 → PD3/BP5 — 环境→心理
+#   PD3 → BP6 → CM1 — 恐慌→认知→运动
+#   CM1 → FL4 → P6 → CM1 — 人群密度瓶颈
+#   CM1 → S2 ← BP5 — 社会从众
+# ============================================================
+
+time_groups:
+  micro:
+    dt: 0.02
+    description: "高频微观碰撞与动力学"
+  meso:
+    dt: 0.1
+    description: "中频气体扩散 / 排风 / 从众 / 注意力"
+  macro:
+    dt: 0.5
+    description: "低频情绪评估与认知表现"
+  event:
+    dt: 0.0
+    description: "事件驱动（可选异步唤醒）"
+
+simulators:
+  FL5:
+    class: "atoms.physical.HeavyGasDiffusion2D"
+    group: meso
+    params:
+      grid_size: [50, 50]
+      cell_size: 0.5
+      diffusion_coeff: 0.04
+      sedimentation_coeff: 0.35
+      floor_enhance_rows: 8
+      floor_diffusion_boost: 2.0
+
+  VT1:
+    class: "atoms.physical.IntelligentVentilation"
+    group: meso
+    params:
+      grid_size: [50, 50]
+      zone_rows: 5
+      zone_cols: 5
+      concentration_threshold: 0.10
+      max_extraction_rate: 0.50
+      response_gain: 1.3
+
+  FL4:
+    class: "atoms.physical.CrowdFluid"
+    group: meso
+    params:
+      grid_size: [50, 50]
+      cell_size: 0.5
+
+  CM1:
+    class: "atoms.physical.RigidBody2D"
+    group: micro
+    params:
+      num_agents: 180
+      world_size: [25.0, 25.0]
+
+  P6:
+    class: "atoms.physical.BottleneckGate"
+    group: meso
+    params:
+      capacity: 1.8
+      gate_width: 1.5
+      critical_density: 4.5
+
+  PD3:
+    class: "atoms.social.EmotionAppraisal"
+    group: macro
+    params:
+      num_agents: 180
+      novelty_weight: 0.35
+      obstruction_weight: 0.35
+      coping_weight: 0.30
+
+  BP6:
+    class: "atoms.social.StressPerformanceCurve"
+    group: macro
+    params:
+      num_agents: 180
+
+  S2:
+    class: "atoms.social.HerdBehavior"
+    group: meso
+    params:
+      num_agents: 180
+      neighbor_radius: 3.5
+
+  BP5:
+    class: "atoms.social.AttentionAllocator"
+    group: meso
+    params:
+      num_agents: 180
+      smoke_attention_cost: 0.65
+      noise_attention_cost: 0.25
+
+connections:
+
+  # ========== 1. 重气体环境 → 心理/认知 ==========
+
+  - connection_id: fl5_gas_to_pd3_exposure
+    source: { sim_id: FL5, port: gas_concentration_field }
+    target: { sim_id: PD3, port: smoke_exposure }
+    strategy: AVG
+    transform: gas_field_to_per_agent_exposure
+    description: "气体浓度场 → 逐个体暴露度 (CM1.positions 采样, AVG 平滑)"
+
+  - connection_id: fl5_hazard_to_pd3_danger
+    source: { sim_id: FL5, port: gas_hazard_field }
+    target: { sim_id: PD3, port: local_danger }
+    strategy: AVG
+    transform: gas_hazard_field_to_per_agent_danger
+    description: "毒性危害场 → 逐个体危险度 (替代火灾温度通道)"
+
+  - connection_id: fl5_vis_to_pd3
+    source: { sim_id: FL5, port: visibility_field }
+    target: { sim_id: PD3, port: exit_visibility }
+    strategy: AVG
+    transform: gas_visibility_field_to_per_agent_visibility
+    description: "能见度场 → 逐个体可见度 (出口指引受阻)"
+
+  - connection_id: fl5_gas_to_bp5
+    source: { sim_id: FL5, port: gas_concentration_field }
+    target: { sim_id: BP5, port: smoke_exposure }
+    strategy: ZOH
+    transform: gas_field_to_per_agent_exposure
+    description: "气体浓度 → 注意力占用 (认知资源被毒性气体剥夺)"
+
+  # ========== 2. 智能排风物理反馈环 ==========
+
+  - connection_id: fl5_conc_to_vt1
+    source: { sim_id: FL5, port: gas_concentration_field }
+    target: { sim_id: VT1, port: gas_concentration_field }
+    strategy: ZOH
+    transform: identity
+    description: "浓度场 → 排风控制器监测输入"
+
+  - connection_id: vt1_vent_to_fl5
+    source: { sim_id: VT1, port: ventilation_field }
+    target: { sim_id: FL5, port: ventilation_field }
+    strategy: AVG
+    transform: identity
+    description: "排风抽取场 → 气体扩散消散 (AVG 打破代数环)"
+
+  # ========== 3. 心理 → 物理运动 ==========
+
+  - connection_id: pd3_panic_to_bp6
+    source: { sim_id: PD3, port: panic_level }
+    target: { sim_id: BP6, port: panic_level }
+    strategy: ZOH
+    transform: identity
+    description: "恐慌值 → 压力-表现曲线"
+
+  - connection_id: bp6_eff_to_cm1
+    source: { sim_id: BP6, port: cognitive_efficiency_multiplier }
+    target: { sim_id: CM1, port: cognitive_efficiency }
+    strategy: INTERP
+    transform: identity
+    description: "认知效率 → 运动决策 (气体暴露导致行动迟缓)"
+
+  - connection_id: s2_bias_to_cm1
+    source: { sim_id: S2, port: herd_velocity_bias }
+    target: { sim_id: CM1, port: herd_bias }
+    strategy: ZOH
+    transform: identity
+    description: "恐慌从众偏置 → 期望速度叠加"
+
+  # ========== 4. 社会互动 ==========
+
+  - connection_id: cm1_pos_to_s2
+    source: { sim_id: CM1, port: positions }
+    target: { sim_id: S2, port: agent_positions }
+    strategy: ZOH
+    transform: identity
+    description: "位置 → 邻居探测"
+
+  - connection_id: cm1_vel_to_s2
+    source: { sim_id: CM1, port: velocities }
+    target: { sim_id: S2, port: neighbor_velocities }
+    strategy: ZOH
+    transform: identity
+    description: "速度 → 从众参考"
+
+  - connection_id: bp5_mask_to_s2
+    source: { sim_id: BP5, port: perception_mask }
+    target: { sim_id: S2, port: individual_confidence }
+    strategy: ZOH
+    transform: identity
+    description: "感知能力 → 个体信心 (低信心更易从众)"
+
+  # ========== 5. 人群物理反馈 ==========
+
+  - connection_id: cm1_pos_to_fl4
+    source: { sim_id: CM1, port: positions }
+    target: { sim_id: FL4, port: agent_positions }
+    strategy: ZOH
+    transform: identity
+    description: "个体位置 → 宏观密度场"
+
+  - connection_id: fl4_density_to_p6
+    source: { sim_id: FL4, port: density_map }
+    target: { sim_id: P6, port: density }
+    strategy: ZOH
+    transform: identity
+    description: "密度场 → 出口瓶颈限流"
+
+  - connection_id: p6_constraint_to_cm1
+    source: { sim_id: P6, port: flow_constraint }
+    target: { sim_id: CM1, port: flow_constraint }
+    strategy: ZOH
+    transform: identity
+    description: "瓶颈约束 → 运动限速"
+
+scenario:
+  duration: 90.0
+  snapshot_interval: 1.0
+
+  # 泄漏点: [grid_row, grid_col, source_rate (1/s)]
+  # 位于站厅中部轨道侧，重气体会沉降并沿地面蔓延
+  leak_points:
+    - [38, 25, 0.35]
+    - [39, 24, 0.28]
+    - [39, 26, 0.28]
+
+  # 站台两端出口 (世界坐标, m)
+  exits:
+    - [1.5, 12.5]
+    - [23.5, 12.5]
+
+  # 地铁站厅布局: 外墙 + 站台中隔墙 + 轨道侧墙
+  walls:
+    # 外墙 (y=12.5 处开 2m 宽出口)
+    - [[0, 0], [25, 0]]
+    - [[25, 0], [25, 11.5]]
+    - [[25, 13.5], [25, 25]]
+    - [[25, 25], [0, 25]]
+    - [[0, 25], [0, 13.5]]
+    - [[0, 11.5], [0, 0]]
+    # 站台中隔墙 (两侧留通道)
+    - [[8, 0], [8, 10]]
+    - [[8, 15], [8, 25]]
+    - [[17, 0], [17, 10]]
+    - [[17, 15], [17, 25]]
+    # 轨道侧矮栏 (气体可越过但行人受限)
+    - [[12, 0], [12, 8]]
+    - [[12, 17], [12, 25]]
+    - [[13, 0], [13, 8]]
+    - [[13, 17], [13, 25]]
+
+  # 场景噪声 (恐慌喊叫等) — 写入 BP5.inputs
+  ambient_noise_level: 0.15
+
+  # 浓度突变事件监测阈值
+  gas_spike_threshold: 0.55

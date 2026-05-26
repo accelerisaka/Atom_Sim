@@ -1,0 +1,349 @@
+# ============================================================
+# 体育场突发爆炸 → 极端踩踏 + 应急广播引导 — S2S 拓扑
+# ============================================================
+#
+# 场景代号: stadium_crush
+# 运行入口: run_stadium_crush.py
+#
+# 闭环数据流:
+#   EX1(爆炸冲击波) → PD3/BP5 — 灾害→心理
+#   CM1 → FL4 → CF1 → CM1/PD3 — 密度→挤压应力→跌倒冲击
+#   CM1 → FL4 → P6 → CM1 — 瓶颈限流
+#   BC1 → EG1 ← PD3/BP5 → CM1 — 广播引导 vs 恐慌从众
+#   CM1 → S2 ← BP5 — 盲从周围人群
+#   CM1 → SD4 (EVENT) — 跌倒旁观者效应
+# ============================================================
+
+time_groups:
+  micro:
+    dt: 0.02
+    description: "高频微观碰撞与动力学"
+  meso:
+    dt: 0.1
+    description: "中频冲击波/挤压/从众/广播/注意力"
+  macro:
+    dt: 0.5
+    description: "低频情绪评估与认知表现"
+  event:
+    dt: 0.0
+    description: "事件驱动（跌倒→旁观者）"
+
+simulators:
+  EX1:
+    class: "atoms.physical.ExplosionBlastWave"
+    group: meso
+    params:
+      grid_size: [50, 50]
+      cell_size: 0.5
+      wave_speed: 10.0
+      decay_rate: 0.40
+      peak_intensity: 1.0
+
+  CF1:
+    class: "atoms.physical.CrushStressField"
+    group: meso
+    params:
+      grid_size: [50, 50]
+      safe_density: 2.5
+      critical_density: 5.5
+      max_stress: 1.0
+
+  FL4:
+    class: "atoms.physical.CrowdFluid"
+    group: meso
+    params:
+      grid_size: [50, 50]
+      cell_size: 0.5
+
+  CM1:
+    class: "atoms.physical.RigidBody2D"
+    group: micro
+    params:
+      num_agents: 350
+      world_size: [25.0, 25.0]
+
+  P6:
+    class: "atoms.physical.BottleneckGate"
+    group: meso
+    params:
+      capacity: 1.2
+      gate_width: 1.0
+      critical_density: 4.0
+
+  BC1:
+    class: "atoms.social.EmergencyBroadcast"
+    group: meso
+    params:
+      broadcast_delay: 4.0
+      ramp_duration: 6.0
+      max_guidance: 1.0
+
+  EG1:
+    class: "atoms.social.BroadcastCompliance"
+    group: meso
+    params:
+      num_agents: 350
+      sanity_threshold: 0.50
+
+  PD3:
+    class: "atoms.social.EmotionAppraisal"
+    group: macro
+    params:
+      num_agents: 350
+      novelty_weight: 0.40
+      obstruction_weight: 0.35
+      coping_weight: 0.25
+
+  BP6:
+    class: "atoms.social.StressPerformanceCurve"
+    group: macro
+    params:
+      num_agents: 350
+
+  S2:
+    class: "atoms.social.HerdBehavior"
+    group: meso
+    params:
+      num_agents: 350
+      neighbor_radius: 3.0
+      max_bias_magnitude: 1.2
+
+  BP5:
+    class: "atoms.social.AttentionAllocator"
+    group: meso
+    params:
+      num_agents: 350
+      smoke_attention_cost: 0.50
+      noise_attention_cost: 0.40
+
+  SD4:
+    class: "atoms.social.BystanderEffect"
+    group: event
+    params:
+      num_agents: 350
+      base_help_probability: 0.35
+
+connections:
+
+  # ========== 1. 爆炸灾害 → 心理/认知 ==========
+
+  - connection_id: ex1_blast_to_pd3_danger
+    source: { sim_id: EX1, port: blast_hazard_field }
+    target: { sim_id: PD3, port: local_danger }
+    strategy: AVG
+    transform: blast_hazard_field_to_per_agent_danger
+    description: "爆炸危害场 → 逐个体危险度 (恐慌新奇性)"
+
+  - connection_id: ex1_dust_to_pd3_visibility
+    source: { sim_id: EX1, port: dust_visibility_field }
+    target: { sim_id: PD3, port: exit_visibility }
+    strategy: AVG
+    transform: dust_visibility_field_to_per_agent_visibility
+    description: "烟尘能见度 → 逐个体出口可见度"
+
+  - connection_id: cf1_crush_to_pd3_exposure
+    source: { sim_id: CF1, port: crush_stress_field }
+    target: { sim_id: PD3, port: smoke_exposure }
+    strategy: AVG
+    transform: crush_stress_field_to_per_agent_danger
+    description: "挤压应力 → 逐个体压迫暴露 (窒息感)"
+
+  - connection_id: ex1_blast_to_bp5_noise
+    source: { sim_id: EX1, port: blast_hazard_field }
+    target: { sim_id: BP5, port: smoke_exposure }
+    strategy: ZOH
+    transform: blast_hazard_field_to_per_agent_danger
+    description: "爆炸冲击 → 注意力占用 (轰鸣/烟尘)"
+
+  # ========== 2. 人群挤压物理反馈 ==========
+
+  - connection_id: fl4_density_to_cf1
+    source: { sim_id: FL4, port: density_map }
+    target: { sim_id: CF1, port: density_map }
+    strategy: ZOH
+    transform: identity
+    description: "宏观密度场 → 挤压应力计算"
+
+  - connection_id: cf1_crush_to_cm1_impulses
+    source: { sim_id: CF1, port: crush_stress_field }
+    target: { sim_id: CM1, port: external_impulses }
+    strategy: ZOH
+    transform: crush_stress_field_to_per_agent_impulses
+    description: "挤压应力 → 逐个体物理冲击冲量"
+
+  # ========== 3. 应急广播引导链 ==========
+
+  - connection_id: bc1_active_to_eg1
+    source: { sim_id: BC1, port: broadcast_active }
+    target: { sim_id: EG1, port: broadcast_active }
+    strategy: ZOH
+    transform: identity
+    description: "广播激活状态 → 服从度计算"
+
+  - connection_id: bc1_guidance_to_eg1
+    source: { sim_id: BC1, port: guidance_intensity }
+    target: { sim_id: EG1, port: guidance_intensity }
+    strategy: ZOH
+    transform: identity
+    description: "广播引导强度 → 服从度计算"
+
+  - connection_id: pd3_panic_to_eg1
+    source: { sim_id: PD3, port: panic_level }
+    target: { sim_id: EG1, port: panic_level }
+    strategy: ZOH
+    transform: identity
+    description: "恐慌水平 → 广播服从 (高恐慌则不听)"
+
+  - connection_id: bp5_mask_to_eg1
+    source: { sim_id: BP5, port: perception_mask }
+    target: { sim_id: EG1, port: perception_mask }
+    strategy: ZOH
+    transform: identity
+    description: "感知掩码 → 广播服从 (注意力资源)"
+
+  - connection_id: eg1_compliance_to_cm1_velocity
+    source: { sim_id: EG1, port: compliance_weight }
+    target: { sim_id: CM1, port: desired_velocity }
+    strategy: INTERP
+    transform: compliance_weight_to_desired_velocity
+    description: "服从权重 → 朝播报备用出口的期望速度"
+
+  # ========== 4. 心理 → 物理运动 ==========
+
+  - connection_id: pd3_panic_to_bp6
+    source: { sim_id: PD3, port: panic_level }
+    target: { sim_id: BP6, port: panic_level }
+    strategy: ZOH
+    transform: identity
+    description: "恐慌值 → 压力-表现曲线"
+
+  - connection_id: bp6_eff_to_cm1
+    source: { sim_id: BP6, port: cognitive_efficiency_multiplier }
+    target: { sim_id: CM1, port: cognitive_efficiency }
+    strategy: INTERP
+    transform: identity
+    description: "认知效率 → 运动决策 (恐慌时行动紊乱)"
+
+  - connection_id: s2_bias_to_cm1
+    source: { sim_id: S2, port: herd_velocity_bias }
+    target: { sim_id: CM1, port: herd_bias }
+    strategy: ZOH
+    transform: identity
+    description: "恐慌从众偏置 → 期望速度叠加 (盲从主流)"
+
+  # ========== 5. 社会互动 ==========
+
+  - connection_id: cm1_pos_to_s2
+    source: { sim_id: CM1, port: positions }
+    target: { sim_id: S2, port: agent_positions }
+    strategy: ZOH
+    transform: identity
+    description: "位置 → 邻居探测"
+
+  - connection_id: cm1_vel_to_s2
+    source: { sim_id: CM1, port: velocities }
+    target: { sim_id: S2, port: neighbor_velocities }
+    strategy: ZOH
+    transform: identity
+    description: "速度 → 从众参考"
+
+  - connection_id: bp5_mask_to_s2
+    source: { sim_id: BP5, port: perception_mask }
+    target: { sim_id: S2, port: individual_confidence }
+    strategy: ZOH
+    transform: identity
+    description: "感知能力 → 个体信心 (低信心更易从众)"
+
+  # ========== 6. 人群物理反馈环 ==========
+
+  - connection_id: cm1_pos_to_fl4
+    source: { sim_id: CM1, port: positions }
+    target: { sim_id: FL4, port: agent_positions }
+    strategy: ZOH
+    transform: identity
+    description: "个体位置 → 宏观密度场"
+
+  - connection_id: fl4_density_to_p6
+    source: { sim_id: FL4, port: density_map }
+    target: { sim_id: P6, port: density }
+    strategy: ZOH
+    transform: identity
+    description: "密度场 → 狭窄通道瓶颈限流"
+
+  - connection_id: p6_constraint_to_cm1
+    source: { sim_id: P6, port: flow_constraint }
+    target: { sim_id: CM1, port: flow_constraint }
+    strategy: ZOH
+    transform: identity
+    description: "瓶颈约束 → 运动限速"
+
+  # ========== 7. 事件驱动：跌倒 → 旁观者 ==========
+
+  - connection_id: cm1_fallen_to_sd4
+    source: { sim_id: CM1, port: fallen }
+    target: { sim_id: SD4, port: fallen_mask }
+    strategy: EVENT
+    transform: identity
+    description: "跌倒事件 → 旁观者救助判定"
+
+  - connection_id: cm1_active_to_sd4
+    source: { sim_id: CM1, port: active }
+    target: { sim_id: SD4, port: active_mask }
+    strategy: EVENT
+    transform: identity
+    description: "活跃掩码 → 旁观者"
+
+  - connection_id: cm1_pos_to_sd4_event
+    source: { sim_id: CM1, port: positions }
+    target: { sim_id: SD4, port: agent_positions }
+    strategy: EVENT
+    transform: identity
+    description: "位置 → 旁观者距离计算"
+
+scenario:
+  duration: 75.0
+  snapshot_interval: 1.0
+
+  # 爆炸点: [grid_row, grid_col, intensity]
+  # 体育场东侧看台下方（人群密集区）
+  blast_points:
+    - [12, 42, 1.0]
+    - [13, 41, 0.85]
+    - [13, 43, 0.85]
+
+  # 主出口 (世界坐标 m) — 西侧宽通道 + 南侧应急门
+  exits:
+    - [12.5, 1.5]
+    - [12.5, 23.5]
+    - [23.5, 12.5]
+
+  # 广播规划的备用出口索引 (0=西侧主通道, 与盲从人群涌向南侧形成对比)
+  announced_exit_index: 0
+
+  # 体育场布局: 椭圆看台 + 中央场地 + 狭窄南侧通道（易踩踏）
+  walls:
+    # 外墙
+    - [[0, 0], [25, 0]]
+    - [[25, 0], [25, 25]]
+    - [[25, 25], [0, 25]]
+    - [[0, 25], [0, 0]]
+    # 中央场地隔离栏
+    - [[10, 8], [15, 8]]
+    - [[10, 17], [15, 17]]
+    - [[10, 8], [10, 17]]
+    - [[15, 8], [15, 17]]
+    # 南侧狭窄通道侧墙 (形成瓶颈)
+    - [[20, 10], [24, 10]]
+    - [[20, 15], [24, 15]]
+
+  # 初始人群聚集区 [x_min, x_max, y_min, y_max] (爆炸点东侧看台)
+  initial_spawn_region: [18.0, 24.0, 18.0, 24.0]
+
+  # 场景噪声 (尖叫/爆炸余音)
+  ambient_noise_level: 0.35
+
+  # 广播延迟 (s) — 由 BC1 内部参数也可覆盖
+  broadcast_delay: 4.0
+
+  # 挤压应力突变事件阈值
+  crush_spike_threshold: 0.65

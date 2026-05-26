@@ -562,3 +562,326 @@ def temperature_field_to_per_household_temp(
         return None
     cell_size = _get_grid_cell_size(ctx, "TD1", fallback=1.0)
     return _sample_field_at_positions(field_T, positions, cell_size, default=30.0)
+
+
+# =============================================================================
+# 地铁站有毒重气体泄漏 + 智能排风疏散场景（Subway Heavy Gas Leak）追加 Transforms
+# =============================================================================
+#
+# 设计说明
+# --------
+# FL5 输出三种二维场（浓度 / 毒性危害 / 能见度），需在 CM1.positions 处采样为
+# 逐个体 ndarray[n]，再分别送入 PD3（local_danger / smoke_exposure / exit_visibility）
+# 与 BP5（smoke_exposure）。VT1 ↔ FL5 的排风场形状一致，使用 identity。
+# 泄漏源强度场由 run_subway_gas.py 在场景初始化时直接写入 FL5.inputs，
+# 不经 S2S 连接。
+# =============================================================================
+
+
+@register_transform(
+    name="gas_field_to_per_agent_exposure",
+    source_schema="ndarray[H, W] float, 气体浓度 [0, 1]",
+    target_schema="ndarray[n] float, [0, 1]",
+    description=(
+        "在每个个体位置处采样 FL5 气体浓度场，得到该个体的气体暴露度。\n"
+        "需要 ctx: CM1.state['positions']、FL5.cell_size。\n"
+        "公式：exposure_i = clip(C(pos_i), 0, 1)"
+    ),
+    connections=["fl5_gas_to_pd3_exposure", "fl5_gas_to_bp5"],
+)
+def gas_field_to_per_agent_exposure(
+    field_C: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_agent_positions(ctx)
+    if field_C is None or positions is None:
+        return None
+    cell_size = _get_grid_cell_size(ctx, "FL5")
+    sampled = _sample_field_at_positions(field_C, positions, cell_size)
+    if sampled is None:
+        return None
+    return np.clip(sampled, 0.0, 1.0)
+
+
+@register_transform(
+    name="gas_hazard_field_to_per_agent_danger",
+    source_schema="ndarray[H, W] float, 毒性危害 [0, 1]",
+    target_schema="ndarray[n] float, [0, 1]",
+    description=(
+        "在每个个体位置处采样 FL5 毒性危害场，映射为 PD3 的 local_danger。\n"
+        "需要 ctx: CM1.state['positions']、FL5.cell_size。\n"
+        "公式：danger_i = clip(H(pos_i), 0, 1)"
+    ),
+    connections=["fl5_hazard_to_pd3_danger", "fl5_hazard_spike_to_pd3_event"],
+)
+def gas_hazard_field_to_per_agent_danger(
+    field_H: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_agent_positions(ctx)
+    if field_H is None or positions is None:
+        return None
+    cell_size = _get_grid_cell_size(ctx, "FL5")
+    sampled = _sample_field_at_positions(field_H, positions, cell_size)
+    if sampled is None:
+        return None
+    return np.clip(sampled, 0.0, 1.0)
+
+
+@register_transform(
+    name="gas_visibility_field_to_per_agent_visibility",
+    source_schema="ndarray[H, W] float, 能见度 [0, 1] (1=完全可见)",
+    target_schema="ndarray[n] float, [0, 1]",
+    description=(
+        "在每个个体位置处采样 FL5 能见度场，得到该个体的局部可见度。\n"
+        "需要 ctx: CM1.state['positions']、FL5.cell_size。\n"
+        "公式：vis_i = clip(V(pos_i), 0, 1)"
+    ),
+    connections=["fl5_vis_to_pd3"],
+)
+def gas_visibility_field_to_per_agent_visibility(
+    field_V: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_agent_positions(ctx)
+    if field_V is None or positions is None:
+        return None
+    cell_size = _get_grid_cell_size(ctx, "FL5")
+    sampled = _sample_field_at_positions(field_V, positions, cell_size, default=1.0)
+    if sampled is None:
+        return None
+    return np.clip(sampled, 0.0, 1.0)
+
+
+@register_transform(
+    name="leak_points_to_gas_source_rate",
+    source_schema="list[[row, col, rate]] — 泄漏点 (网格坐标, 1/s)",
+    target_schema="ndarray[H, W] float, 产气速率 (1/s)",
+    description=(
+        "将离散泄漏点列表映射为 FL5 所需的二维产气源强度场。\n"
+        "需要 ctx: FL5.grid_size (H, W)。\n"
+        "每个泄漏点在对应网格格点叠加 rate；越界点忽略。"
+    ),
+    connections=[],
+)
+def leak_points_to_gas_source_rate(
+    leak_points: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    if leak_points is None or ctx is None:
+        return None
+    grid_size = ctx.sim_attr("FL5", "grid_size", (50, 50))
+    H, W = int(grid_size[0]), int(grid_size[1])
+    rate_field = np.zeros((H, W), dtype=np.float64)
+    for pt in leak_points:
+        if not isinstance(pt, (list, tuple)) or len(pt) < 3:
+            continue
+        r, c, rate = int(pt[0]), int(pt[1]), float(pt[2])
+        if 0 <= r < H and 0 <= c < W:
+            rate_field[r, c] += rate
+    return rate_field
+
+
+# =============================================================================
+# 体育场突发灾害踩踏 + 应急广播引导场景（Stadium Crush Evacuation）追加 Transforms
+# =============================================================================
+#
+# 设计说明
+# --------
+# EX1 爆炸危害场 / 烟尘能见度场 → 在 CM1.positions 采样为逐个体向量，送入 PD3。
+# CF1 挤压应力场 → 采样为逐个体冲击冲量 (CM1.external_impulses) 与附加危险度 (PD3)。
+# EG1 服从权重 + BC1 播报出口 → 在 transform 中结合 CM1 位置生成 CM1.desired_velocity。
+# 爆心种子场由 run_stadium_crush.py 场景初始化写入 EX1.inputs，不经 S2S。
+# =============================================================================
+
+
+@register_transform(
+    name="blast_hazard_field_to_per_agent_danger",
+    source_schema="ndarray[H, W] float, 爆炸危害 [0, 1]",
+    target_schema="ndarray[n] float, [0, 1]",
+    description=(
+        "在每个个体位置处采样 EX1 爆炸危害场，映射为 PD3 的 local_danger。\n"
+        "需要 ctx: CM1.state['positions']、EX1.cell_size。"
+    ),
+    connections=["ex1_blast_to_pd3_danger"],
+)
+def blast_hazard_field_to_per_agent_danger(
+    field_H: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_agent_positions(ctx)
+    if field_H is None or positions is None:
+        return None
+    cell_size = _get_grid_cell_size(ctx, "EX1")
+    sampled = _sample_field_at_positions(field_H, positions, cell_size)
+    if sampled is None:
+        return None
+    return np.clip(sampled, 0.0, 1.0)
+
+
+@register_transform(
+    name="dust_visibility_field_to_per_agent_visibility",
+    source_schema="ndarray[H, W] float, 能见度 [0, 1] (1=完全可见)",
+    target_schema="ndarray[n] float, [0, 1]",
+    description=(
+        "在每个个体位置处采样 EX1 烟尘能见度场，得到 PD3 的 exit_visibility。\n"
+        "需要 ctx: CM1.state['positions']、EX1.cell_size。"
+    ),
+    connections=["ex1_dust_to_pd3_visibility"],
+)
+def dust_visibility_field_to_per_agent_visibility(
+    field_V: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_agent_positions(ctx)
+    if field_V is None or positions is None:
+        return None
+    cell_size = _get_grid_cell_size(ctx, "EX1")
+    sampled = _sample_field_at_positions(field_V, positions, cell_size, default=1.0)
+    if sampled is None:
+        return None
+    return np.clip(sampled, 0.0, 1.0)
+
+
+@register_transform(
+    name="crush_stress_field_to_per_agent_danger",
+    source_schema="ndarray[H, W] float, 挤压应力 [0, 1]",
+    target_schema="ndarray[n] float, [0, 1]",
+    description=(
+        "在每个个体位置处采样 CF1 挤压应力场，作为 PD3 的 smoke_exposure 端口输入"
+        "（语义：物理挤压带来的窒息/压迫感）。\n"
+        "需要 ctx: CM1.state['positions']、CF1 对应 FL4.cell_size。"
+    ),
+    connections=["cf1_crush_to_pd3_exposure"],
+)
+def crush_stress_field_to_per_agent_danger(
+    field_S: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_agent_positions(ctx)
+    if field_S is None or positions is None:
+        return None
+    cell_size = _get_grid_cell_size(ctx, "FL4")
+    sampled = _sample_field_at_positions(field_S, positions, cell_size)
+    if sampled is None:
+        return None
+    return np.clip(sampled, 0.0, 1.0)
+
+
+@register_transform(
+    name="crush_stress_field_to_per_agent_impulses",
+    source_schema="ndarray[H, W] float, 挤压应力 [0, 1]",
+    target_schema="ndarray[n, 2] float, 冲击力 (N 量纲缩放)",
+    description=(
+        "将 CF1 挤压应力场在个体位置采样，并沿局部密度梯度方向生成冲击冲量，"
+        "注入 CM1.external_impulses。\n"
+        "需要 ctx: CM1.state['positions']、FL4.cell_size；可选读取 CF1 同网格应力。"
+    ),
+    connections=["cf1_crush_to_cm1_impulses"],
+)
+def crush_stress_field_to_per_agent_impulses(
+    field_S: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_agent_positions(ctx)
+    if field_S is None or positions is None:
+        return None
+    cell_size = _get_grid_cell_size(ctx, "FL4")
+    stress = _sample_field_at_positions(field_S, positions, cell_size)
+    if stress is None:
+        return None
+
+    n = positions.shape[0]
+    impulses = np.zeros((n, 2), dtype=np.float64)
+    fld = np.asarray(field_S, dtype=np.float64)
+    H, W = fld.shape
+
+    for i in range(n):
+        gr = int(np.clip(positions[i, 0] / cell_size, 1, H - 2))
+        gc = int(np.clip(positions[i, 1] / cell_size, 1, W - 2))
+        grad_r = fld[gr + 1, gc] - fld[gr - 1, gc]
+        grad_c = fld[gr, gc + 1] - fld[gr, gc - 1]
+        direction = np.array([grad_r, grad_c], dtype=np.float64)
+        norm = np.linalg.norm(direction)
+        if norm < 1e-6:
+            direction = np.random.randn(2) * 0.01
+            norm = np.linalg.norm(direction)
+        direction /= norm
+        magnitude = float(stress[i]) * 1800.0
+        impulses[i] = direction * magnitude
+
+    return impulses
+
+
+@register_transform(
+    name="compliance_weight_to_desired_velocity",
+    source_schema="ndarray[n] float, 广播服从权重 [0, 1]",
+    target_schema="ndarray[n, 2] float, 期望速度 (m/s)",
+    description=(
+        "将 EG1 服从权重与 BC1 播报的出口方向结合 CM1 位置，生成朝备用出口的"
+        "期望速度向量，写入 CM1.desired_velocity。\n"
+        "需要 ctx: CM1.positions、BC1.get_announced_exit_position() 或 state。"
+    ),
+    connections=["eg1_compliance_to_cm1_velocity"],
+)
+def compliance_weight_to_desired_velocity(
+    compliance: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_agent_positions(ctx)
+    if compliance is None or positions is None or ctx is None:
+        return None
+
+    comp = np.asarray(compliance, dtype=np.float64).ravel()
+    n = positions.shape[0]
+    if comp.size == 1:
+        comp = np.full(n, float(comp[0]), dtype=np.float64)
+    elif comp.size < n:
+        comp = np.concatenate([comp, np.zeros(n - comp.size)])
+    comp = comp[:n]
+
+    bc1 = ctx.simulators.get("BC1")
+    if bc1 is not None and hasattr(bc1, "get_announced_exit_position"):
+        exit_pos = bc1.get_announced_exit_position()
+    else:
+        exit_pos = np.array([0.0, 0.0], dtype=np.float64)
+
+    base_speed = 1.4
+    if hasattr(ctx.simulators.get("CM1"), "state"):
+        cm1 = ctx.simulators.get("CM1")
+        if cm1 is not None:
+            ds = cm1.state.get("desired_speed")
+            if ds is not None:
+                base_speed = float(np.mean(np.asarray(ds)))
+
+    desired = np.zeros((n, 2), dtype=np.float64)
+    for i in range(n):
+        direction = exit_pos - positions[i]
+        norm = np.linalg.norm(direction)
+        if norm > 1e-6:
+            direction /= norm
+        desired[i] = direction * base_speed * comp[i]
+
+    return desired
+
+
+@register_transform(
+    name="blast_points_to_seed_field",
+    source_schema="list[[row, col, intensity]] — 爆炸点 (网格坐标, [0,1])",
+    target_schema="ndarray[H, W] float, 初始危害脉冲",
+    description=(
+        "将离散爆炸点列表映射为 EX1 所需的二维初始脉冲场。\n"
+        "需要 ctx: EX1.grid_size (H, W)。"
+    ),
+    connections=[],
+)
+def blast_points_to_seed_field(
+    blast_points: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    if blast_points is None or ctx is None:
+        return None
+    grid_size = ctx.sim_attr("EX1", "grid_size", (50, 50))
+    H, W = int(grid_size[0]), int(grid_size[1])
+    seed = np.zeros((H, W), dtype=np.float64)
+    for pt in blast_points:
+        if not isinstance(pt, (list, tuple)) or len(pt) < 3:
+            continue
+        r, c, intensity = int(pt[0]), int(pt[1]), float(pt[2])
+        if 0 <= r < H and 0 <= c < W:
+            seed[r, c] = max(seed[r, c], intensity)
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < H and 0 <= cc < W:
+                    seed[rr, cc] = max(seed[rr, cc], intensity * 0.6)
+    return seed
