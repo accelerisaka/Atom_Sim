@@ -562,3 +562,96 @@ def temperature_field_to_per_household_temp(
         return None
     cell_size = _get_grid_cell_size(ctx, "TD1", fallback=1.0)
     return _sample_field_at_positions(field_T, positions, cell_size, default=30.0)
+
+
+# =============================================================================
+# 冬季寒潮 + 新能源车晚高峰充电场景（Cold Wave + EV Peak）追加 Transforms
+# =============================================================================
+
+
+def _get_winter_household_positions(ctx: Optional[TransformContext]) -> Optional[np.ndarray]:
+    """优先从 HU2.state 读取冬季家庭位置；回落到 bus 快照。"""
+    if ctx is None:
+        return None
+    pos = ctx.sim_state("HU2", "positions")
+    if pos is None:
+        hu2_bus = ctx.bus.get("HU2", {}) if ctx.bus else {}
+        pos = hu2_bus.get("positions")
+    return pos
+
+
+@register_transform(
+    name="temperature_field_to_per_household_temp_hu2",
+    source_schema="ndarray[H, W] float, 单位 °C",
+    target_schema="ndarray[N] float, 单位 °C",
+    description=(
+        "在 HU2 每户家庭位置处采样户外温度场，得到该户的局部环境温度。\n"
+        "需要 ctx: HU2.state['positions']、TD1.cell_size。\n"
+        "用于冬季寒潮场景（EH1/PD8 的 local_temp 输入）。"
+    ),
+    connections=[
+        "td1_temp_to_eh1",
+        "td1_temp_to_pd8",
+    ],
+)
+def temperature_field_to_per_household_temp_hu2(
+    field_T: Any, ctx: Optional[TransformContext]
+) -> Optional[np.ndarray]:
+    positions = _get_winter_household_positions(ctx)
+    if field_T is None or positions is None:
+        return None
+    cell_size = _get_grid_cell_size(ctx, "TD1", fallback=1.0)
+    return _sample_field_at_positions(field_T, positions, cell_size, default=-5.0)
+
+
+# =============================================================================
+# 分布式光伏 + 家用储能 VPP 博弈场景（VPP PV + Battery）追加 Transforms
+# =============================================================================
+
+
+@register_transform(
+    name="irradiance_scalar_broadcast",
+    source_schema="float in [0, 1]",
+    target_schema="float in [0, 1]",
+    description="SR1 辐照度标量直通 PV1（identity 语义别名，便于拓扑可读）。",
+    connections=["sr1_irradiance_to_pv1"],
+)
+def irradiance_scalar_broadcast(value: Any, ctx: Optional[TransformContext]) -> Any:
+    if value is None:
+        return None
+    try:
+        return float(np.clip(float(value), 0.0, 1.0))
+    except (TypeError, ValueError):
+        return None
+
+
+@register_transform(
+    name="net_load_ratio_identity",
+    source_schema="float, 净负荷比 ρ=P_total/C (可为负)",
+    target_schema="float, MK2.net_load_ratio",
+    description="GR1.overload_ratio 直通 MK2（支持净上网时 ρ<0 触发谷时/负电价）。",
+    connections=["gr1_ratio_to_mk2"],
+)
+def net_load_ratio_identity(value: Any, ctx: Optional[TransformContext]) -> Any:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@register_transform(
+    name="export_pulse_ratio_identity",
+    source_schema="float, 上网脉冲比",
+    target_schema="float, MK2.export_pulse",
+    description="GR1 大规模净上网边沿脉冲 → MK2 即时压低电价。",
+    connections=["gr1_export_event_to_mk2"],
+)
+def export_pulse_ratio_identity(value: Any, ctx: Optional[TransformContext]) -> Any:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

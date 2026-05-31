@@ -1,0 +1,287 @@
+# ============================================================
+# 分布式光伏 + 家用储能虚拟电厂博弈 — S2S 拓扑连接配置
+# ============================================================
+#
+# 场景：白天光伏大发 → 储能充电 / 余电上网 → 变压器净负荷下降甚至为负
+#       → 电网出现激励性低价（"负电价"隐喻）→ 晚间高峰电价飙升
+#       → 储能根据套利心理放电售电或自用 → 电价回落（博弈闭环）
+#
+# 每一条 S2S 连接均显式声明 transform 字段。
+# ============================================================
+
+time_groups:
+  resource:
+    dt: 1.0
+    description: "太阳辐照度曲线 + 静态 VPP 家庭档案"
+  device:
+    dt: 0.5
+    description: "光伏、基础负荷、储能、净负荷汇总与变压器"
+  market:
+    dt: 2.0
+    description: "双向电价市场与储能套利心理决策"
+  event:
+    dt: 0.0
+    description: "过载/大规模上网脉冲事件"
+
+simulators:
+
+  HU3:
+    class: "atoms.physical.HouseholdVPPProfile"
+    group: resource
+    params:
+      num_households: 24
+      world_size: [30.0, 30.0]
+      pv_capacity_range: [2.5, 9.0]
+      battery_capacity_range: [5.0, 15.0]
+      battery_power_range: [2.5, 6.0]
+      arbitrage_sensitivity_range: [0.25, 1.0]
+      base_load_scale_range: [0.75, 1.25]
+      battery_ownership_rate: 0.88
+      seed: 2030
+
+  SR1:
+    class: "atoms.physical.SolarIrradiance"
+    group: resource
+    params:
+      day_start: 6.0
+      day_end: 78.0
+      day_peak_time: 42.0
+      peak_width: 16.0
+      cloud_noise_amp: 0.06
+
+  PV1:
+    class: "atoms.physical.PVGeneration"
+    group: device
+    params:
+      num_households: 24
+      performance_ratio: 0.91
+
+  HL1:
+    class: "atoms.physical.HouseholdBaseLoad"
+    group: device
+    params:
+      num_households: 24
+      base_kw: 0.42
+      morning_peak_kw: 0.3
+      evening_peak_kw: 1.25
+      morning_center: 20.0
+      evening_center: 108.0
+      peak_width: 11.0
+
+  HB1:
+    class: "atoms.physical.HomeBatteryStorage"
+    group: device
+    params:
+      num_households: 24
+      charge_efficiency: 0.95
+      discharge_efficiency: 0.92
+      min_soc: 0.1
+
+  NL1:
+    class: "atoms.physical.NetLoadAggregator"
+    group: device
+    params:
+      num_households: 24
+
+  GR1:
+    class: "atoms.physical.GridTransformer"
+    group: device
+    params:
+      capacity_kw: 45.0
+      num_households: 24
+      overload_event_threshold: 1.0
+
+  MK2:
+    class: "atoms.social.VPPPriceMarket"
+    group: market
+    params:
+      base_price: 0.55
+      max_multiplier: 4.2
+      min_multiplier: 0.08
+      peak_threshold: 0.8
+      valley_threshold: 0.25
+      peak_sensitivity: 3.1
+      valley_sensitivity: 2.4
+      nonlinearity: 1.35
+      smoothing: 0.3
+      pulse_boost: 0.7
+      export_pulse_cut: 0.4
+
+  PD9:
+    class: "atoms.social.BatteryArbitrageAppraisal"
+    group: market
+    params:
+      num_households: 24
+      reference_price: 0.55
+      peak_elasticity: 2.8
+      valley_self_use_boost: 1.6
+      inertia: 0.48
+      low_soc_brake: 0.22
+      evening_discharge_boost: 0.4
+      evening_start: 88.0
+      evening_end: 168.0
+
+connections:
+
+  # ========== 1. 资源层 → 设备层 ==========
+
+  - connection_id: sr1_irradiance_to_pv1
+    source: { sim_id: SR1, port: irradiance_factor }
+    target: { sim_id: PV1, port: irradiance_factor }
+    strategy: ZOH
+    transform: irradiance_scalar_broadcast
+    description: "归一化辐照度 → 光伏发电驱动"
+
+  - connection_id: hu3_pv_cap_to_pv1
+    source: { sim_id: HU3, port: pv_capacity_kw }
+    target: { sim_id: PV1, port: pv_capacity_kw }
+    strategy: ZOH
+    transform: identity
+    description: "逐户光伏装机 (kW)"
+
+  - connection_id: hu3_load_scale_to_hl1
+    source: { sim_id: HU3, port: base_load_scale }
+    target: { sim_id: HL1, port: base_load_scale }
+    strategy: ZOH
+    transform: identity
+    description: "逐户基础负荷缩放系数"
+
+  - connection_id: hu3_bat_cap_to_hb1
+    source: { sim_id: HU3, port: battery_capacity_kwh }
+    target: { sim_id: HB1, port: battery_capacity_kwh }
+    strategy: ZOH
+    transform: identity
+    description: "逐户电池容量 (kWh)"
+
+  - connection_id: hu3_bat_pwr_to_hb1
+    source: { sim_id: HU3, port: battery_max_power_kw }
+    target: { sim_id: HB1, port: battery_max_power_kw }
+    strategy: ZOH
+    transform: identity
+    description: "逐户电池功率上限 (kW)"
+
+  - connection_id: hu3_has_bat_to_hb1
+    source: { sim_id: HU3, port: has_battery }
+    target: { sim_id: HB1, port: has_battery }
+    strategy: ZOH
+    transform: identity
+    description: "逐户是否安装储能"
+
+  - connection_id: hu3_arbitrage_to_pd9
+    source: { sim_id: HU3, port: arbitrage_sensitivity }
+    target: { sim_id: PD9, port: arbitrage_sensitivity }
+    strategy: ZOH
+    transform: identity
+    description: "逐户套利敏感度（静态档案）"
+
+  # ========== 2. 发电与负荷 → 储能 ==========
+
+  - connection_id: pv1_power_to_hb1
+    source: { sim_id: PV1, port: pv_power }
+    target: { sim_id: HB1, port: pv_power }
+    strategy: AVG
+    transform: identity
+    description: "逐户光伏发电 (kW)"
+
+  - connection_id: hl1_base_to_hb1
+    source: { sim_id: HL1, port: base_load }
+    target: { sim_id: HB1, port: base_load }
+    strategy: AVG
+    transform: identity
+    description: "逐户基础用电 (kW)"
+
+  # ========== 3. 心理决策 → 储能（快慢组 INTERP） ==========
+
+  - connection_id: pd9_discharge_to_hb1
+    source: { sim_id: PD9, port: discharge_fraction }
+    target: { sim_id: HB1, port: discharge_fraction }
+    strategy: INTERP
+    transform: identity
+    description: "向电网放电比例 → 储能控制"
+
+  - connection_id: pd9_selfuse_to_hb1
+    source: { sim_id: PD9, port: self_use_bias }
+    target: { sim_id: HB1, port: self_use_bias }
+    strategy: INTERP
+    transform: identity
+    description: "自用优先偏置 → 抑制上网售电"
+
+  # ========== 4. 净负荷汇总 → 电网 ==========
+
+  - connection_id: hl1_to_nl1_base
+    source: { sim_id: HL1, port: base_load }
+    target: { sim_id: NL1, port: base_load }
+    strategy: AVG
+    transform: identity
+    description: "基础负荷 → 净负荷汇总"
+
+  - connection_id: pv1_to_nl1_pv
+    source: { sim_id: PV1, port: pv_power }
+    target: { sim_id: NL1, port: pv_power }
+    strategy: AVG
+    transform: identity
+    description: "光伏发电 → 净负荷汇总"
+
+  - connection_id: hb1_net_to_nl1
+    source: { sim_id: HB1, port: battery_net_kw }
+    target: { sim_id: NL1, port: battery_net_kw }
+    strategy: AVG
+    transform: identity
+    description: "储能对电网净流 → 净负荷汇总"
+
+  - connection_id: nl1_to_gr1
+    source: { sim_id: NL1, port: household_loads }
+    target: { sim_id: GR1, port: household_loads }
+    strategy: AVG
+    transform: identity
+    description: "逐户净负荷 → 变压器汇总（可为负=净上网）"
+
+  # ========== 5. 储能 SOC 反馈 → 心理 ==========
+
+  - connection_id: hb1_soc_to_pd9
+    source: { sim_id: HB1, port: battery_soc }
+    target: { sim_id: PD9, port: battery_soc }
+    strategy: ZOH
+    transform: identity
+    description: "电池 SOC 反馈套利决策（低电量提升自用）"
+
+  # ========== 6. 电网 → 市场（双通道 AVG + EVENT） ==========
+
+  - connection_id: gr1_ratio_to_mk2
+    source: { sim_id: GR1, port: overload_ratio }
+    target: { sim_id: MK2, port: net_load_ratio }
+    strategy: AVG
+    transform: net_load_ratio_identity
+    description: "净负荷比 ρ（可负）→ 双向电价"
+
+  - connection_id: gr1_overload_event_to_mk2
+    source: { sim_id: GR1, port: overload_pulse_ratio }
+    target: { sim_id: MK2, port: overload_pulse }
+    strategy: EVENT
+    transform: identity
+    description: "过载边沿 → 峰时电价脉冲"
+
+  - connection_id: gr1_export_event_to_mk2
+    source: { sim_id: GR1, port: export_pulse_ratio }
+    target: { sim_id: MK2, port: export_pulse }
+    strategy: EVENT
+    transform: export_pulse_ratio_identity
+    description: "大规模净上网边沿 → 压低电价脉冲"
+
+  # ========== 7. 市场 → 心理（闭环） ==========
+
+  - connection_id: mk2_price_to_pd9
+    source: { sim_id: MK2, port: electricity_price }
+    target: { sim_id: PD9, port: current_price }
+    strategy: ZOH
+    transform: identity
+    description: "电价 → 储能套利心理（闭合 VPP 博弈回路）"
+
+scenario:
+  duration: 180.0
+  snapshot_interval: 1.0
+  export_kw_threshold: -4.0
+  evening_load_boost:
+    enabled: true
+    trigger_time: 95.0
+    extra_evening_kw: 0.35

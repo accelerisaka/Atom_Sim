@@ -1,0 +1,235 @@
+# ============================================================
+# 冬季寒潮 + 新能源车晚高峰充电 — S2S 拓扑连接配置
+# ============================================================
+#
+# 场景：寒潮室外降温 → 电暖器集中开启 → 18 点后 EV 集中充电 →
+#       变压器过载 → 动态电价飙升 → 用户削减 EV 充电、保留取暖（负反馈）
+#
+# 每一条 S2S 连接均显式声明 transform 字段。
+# ============================================================
+
+time_groups:
+  weather:
+    dt: 1.0
+    description: "户外冷环境场 + 静态冬季家庭档案"
+  device:
+    dt: 0.5
+    description: "电暖器、EV 充电、负荷汇总与变压器"
+  market:
+    dt: 2.0
+    description: "动态电价与峰时需求侧响应决策"
+  event:
+    dt: 0.0
+    description: "变压器过载脉冲事件"
+
+simulators:
+
+  TD1:
+    class: "atoms.physical.HeatConduction"
+    group: weather
+    params:
+      grid_size: [30, 30]
+      cell_size: 1.0
+      alpha: 0.05
+      ambient_temp: -8.0
+
+  HU2:
+    class: "atoms.physical.HouseholdWinterProfile"
+    group: weather
+    params:
+      num_households: 24
+      world_size: [30.0, 30.0]
+      sensitivity_range: [0.25, 1.0]
+      heating_setpoint_range: [20.0, 24.0]
+      heating_priority_range: [0.6, 1.0]
+      ev_ownership_rate: 0.7
+      ev_flexibility_range: [0.35, 1.0]
+      seed: 2027
+
+  EH1:
+    class: "atoms.physical.ElectricHeatingLoad"
+    group: device
+    params:
+      num_households: 24
+      heating_coeff: 0.7
+      max_load_per_house: 4.5
+      idle_load: 0.1
+      on_threshold: 0.35
+      default_local_temp: -8.0
+      default_setpoint: 22.0
+
+  EV1:
+    class: "atoms.physical.EVChargingLoad"
+    group: device
+    params:
+      num_households: 24
+      max_charge_kw: 7.0
+      evening_start_time: 25.0
+      evening_end_time: 115.0
+      ramp_seconds: 10.0
+
+  LA1:
+    class: "atoms.physical.LoadAggregator"
+    group: device
+    params:
+      num_households: 24
+
+  GR1:
+    class: "atoms.physical.GridTransformer"
+    group: device
+    params:
+      capacity_kw: 52.0
+      num_households: 24
+      overload_event_threshold: 1.0
+
+  MK1:
+    class: "atoms.social.PriceMarket"
+    group: market
+    params:
+      base_price: 0.55
+      max_multiplier: 4.5
+      sensitivity: 3.2
+      threshold: 0.78
+      nonlinearity: 1.5
+      smoothing: 0.32
+      pulse_boost: 0.75
+
+  PD8:
+    class: "atoms.social.PeakLoadDemandResponse"
+    group: market
+    params:
+      num_households: 24
+      reference_price: 0.55
+      ev_elasticity: 2.8
+      heating_trim_elasticity: 0.3
+      inertia: 0.48
+      cold_brake_temp: -3.0
+
+connections:
+
+  - connection_id: td1_temp_to_eh1
+    source: { sim_id: TD1, port: temperature_field }
+    target: { sim_id: EH1, port: local_temp }
+    strategy: AVG
+    transform: temperature_field_to_per_household_temp_hu2
+    description: "户外温度场 → 逐户局部温度 (电暖器驱动)"
+
+  - connection_id: td1_temp_to_pd8
+    source: { sim_id: TD1, port: temperature_field }
+    target: { sim_id: PD8, port: local_temp }
+    strategy: AVG
+    transform: temperature_field_to_per_household_temp_hu2
+    description: "户外温度场 → 逐户局部温度 (需求响应寒冷刹车)"
+
+  - connection_id: hu2_sensitivity_to_pd8
+    source: { sim_id: HU2, port: price_sensitivity }
+    target: { sim_id: PD8, port: price_sensitivity }
+    strategy: ZOH
+    transform: identity
+    description: "逐户价格敏感度"
+
+  - connection_id: hu2_heating_sp_to_pd8
+    source: { sim_id: HU2, port: heating_setpoint }
+    target: { sim_id: PD8, port: base_heating_setpoint }
+    strategy: ZOH
+    transform: identity
+    description: "逐户基准取暖设定温度"
+
+  - connection_id: hu2_priority_to_pd8
+    source: { sim_id: HU2, port: heating_priority }
+    target: { sim_id: PD8, port: heating_priority }
+    strategy: ZOH
+    transform: identity
+    description: "逐户取暖优先级（保护取暖）"
+
+  - connection_id: hu2_ev_flex_to_pd8
+    source: { sim_id: HU2, port: ev_flexibility }
+    target: { sim_id: PD8, port: ev_flexibility }
+    strategy: ZOH
+    transform: identity
+    description: "逐户 EV 充电灵活度"
+
+  - connection_id: pd8_heating_sp_to_eh1
+    source: { sim_id: PD8, port: heating_setpoint }
+    target: { sim_id: EH1, port: heating_setpoint }
+    strategy: INTERP
+    transform: identity
+    description: "需求响应后的取暖设定 → 电暖器"
+
+  - connection_id: pd8_ev_limit_to_ev1
+    source: { sim_id: PD8, port: ev_charge_limit }
+    target: { sim_id: EV1, port: charge_limit }
+    strategy: INTERP
+    transform: identity
+    description: "峰时 EV 充电功率上限比例"
+
+  - connection_id: hu2_has_ev_to_ev1
+    source: { sim_id: HU2, port: has_ev }
+    target: { sim_id: EV1, port: has_ev }
+    strategy: ZOH
+    transform: identity
+    description: "逐户是否拥有 EV"
+
+  - connection_id: eh1_load_to_la1
+    source: { sim_id: EH1, port: heating_load }
+    target: { sim_id: LA1, port: heating_load }
+    strategy: AVG
+    transform: identity
+    description: "逐户取暖负荷 → 汇总器"
+
+  - connection_id: ev1_load_to_la1
+    source: { sim_id: EV1, port: ev_load }
+    target: { sim_id: LA1, port: ev_load }
+    strategy: AVG
+    transform: identity
+    description: "逐户 EV 负荷 → 汇总器"
+
+  - connection_id: la1_loads_to_gr1
+    source: { sim_id: LA1, port: household_loads }
+    target: { sim_id: GR1, port: household_loads }
+    strategy: AVG
+    transform: identity
+    description: "逐户总负荷 → 变压器"
+
+  - connection_id: gr1_overload_to_mk1
+    source: { sim_id: GR1, port: overload_ratio }
+    target: { sim_id: MK1, port: overload_signal }
+    strategy: AVG
+    transform: identity
+    description: "过载比 → 慢通道电价"
+
+  - connection_id: gr1_overload_event_to_mk1
+    source: { sim_id: GR1, port: overload_pulse_ratio }
+    target: { sim_id: MK1, port: overload_pulse }
+    strategy: EVENT
+    transform: identity
+    description: "过载边沿事件 → 即时调价脉冲"
+
+  - connection_id: mk1_price_to_pd8
+    source: { sim_id: MK1, port: electricity_price }
+    target: { sim_id: PD8, port: current_price }
+    strategy: ZOH
+    transform: identity
+    description: "电价 → 需求侧响应（闭合负反馈）"
+
+scenario:
+  duration: 120.0
+  snapshot_interval: 1.0
+
+  cold_zones:
+    - [4,  4,  -14.0]
+    - [10, 20, -16.0]
+    - [20, 10, -15.0]
+    - [24, 24, -13.0]
+
+  cold_snap:
+    enabled: true
+    trigger_time: 15.0
+    extra_zones:
+      - [14, 14, -18.0]
+      - [8,  16, -17.0]
+      - [18, 8,  -17.5]
+
+  ev_evening:
+    start_time: 25.0
+    description: "模拟 18:00 后集中回家充电"
